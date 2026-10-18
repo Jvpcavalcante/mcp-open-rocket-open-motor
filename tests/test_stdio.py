@@ -16,27 +16,35 @@ def _mensagem(**kw):
     return (json.dumps({"jsonrpc": "2.0", **kw}) + "\n").encode()
 
 
-def test_stdout_so_jsonrpc_e_sai_apos_eof(workspace):
+def _servidor(workspace):
     p = subprocess.Popen([sys.executable, "-m", "rocket_mcp.server"], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          env={**os.environ, "ROCKET_MCP_WORKSPACE": str(workspace)})
     linhas: queue.Queue[bytes] = queue.Queue()
     threading.Thread(target=lambda: [linhas.put(ln) for ln in p.stdout], daemon=True).start()
+    p.stdin.write(_mensagem(id=1, method="initialize", params={
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "pytest", "version": "0"}}))
+    p.stdin.write(_mensagem(method="notifications/initialized"))
+    return p, linhas
+
+
+def _esperar(linhas, ids, timeout=120):
+    respostas = {}
+    while not ids <= respostas.keys():
+        msg = json.loads(linhas.get(timeout=timeout))  # falha se algo além de JSON-RPC sair no stdout
+        if "id" in msg:
+            respostas[msg["id"]] = msg
+    return respostas
+
+
+def test_stdout_so_jsonrpc_e_sai_apos_eof(workspace):
+    p, linhas = _servidor(workspace)
     try:
-        p.stdin.write(_mensagem(id=1, method="initialize", params={
-            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "pytest", "version": "0"}}))
-        p.stdin.write(_mensagem(method="notifications/initialized"))
         # abrir_foguete força o boot completo da JVM e a carga do .ork (o que mais gera log)
         p.stdin.write(_mensagem(id=2, method="tools/call",
                                 params={"name": "abrir_foguete", "arguments": {"arquivo_ork": "foguete.ork"}}))
         p.stdin.flush()
-
-        respostas = {}
-        while 2 not in respostas:
-            linha = linhas.get(timeout=120)
-            msg = json.loads(linha)  # falha se algo além de JSON-RPC sair no stdout
-            if "id" in msg:
-                respostas[msg["id"]] = msg
+        respostas = _esperar(linhas, {1, 2})
         assert "result" in respostas[1]
         assert respostas[2]["result"]["isError"] is False
 
@@ -47,3 +55,18 @@ def test_stdout_so_jsonrpc_e_sai_apos_eof(workspace):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def test_relatorio_pedido_durante_o_boot_da_jvm_nao_trava(workspace):
+    """Regressão: importar o matplotlib (DLLs) enquanto a JVM inicializava travou o processo no Windows.
+    O relatório é pedido logo após o handshake, com a JVM ainda subindo."""
+    p, linhas = _servidor(workspace)
+    try:
+        p.stdin.write(_mensagem(id=2, method="tools/call", params={"name": "gerar_relatorio", "arguments": {
+            "arquivo_ork": "foguete.ork", "arquivo_html": "stdio/relatorio_boot.html", "sobrescrever": True}}))
+        p.stdin.flush()
+        respostas = _esperar(linhas, {1, 2}, timeout=150)
+        assert respostas[2]["result"]["isError"] is False, respostas[2]
+        assert (workspace / "stdio" / "relatorio_boot.html").exists()
+    finally:
+        p.kill()

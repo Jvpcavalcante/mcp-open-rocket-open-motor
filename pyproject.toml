@@ -12,6 +12,7 @@ dependencies = [
     "scikit-fmm",
     "scikit-image",
     "pyyaml",
+    "matplotlib",         # gráficos do gerar_relatorio (API Figure, sem pyplot)
 ]
 
 [project.optional-dependencies]

@@ -188,7 +188,10 @@ _UNIDADES = {
 _TIPOS_GRAO = {nome: cls for nome, cls in grainTypes.items() if nome != "Custom Grain"}  # Custom exige DXF
 _TUBEIRA_OPCIONAIS = {"throatLength", "slagCoeff", "erosionCoeff"}  # 0 = sem comprimento/escória/erosão
 _CAMINHO = re.compile(r"^(?:(?P<secao>nozzle|config)\.(?P<param>\w+)"
-                      r"|grains\[(?P<i>\d+)\](?:\.(?P<gparam>\w+))?|(?P<prop>propellant))$")
+                      r"|grains\[(?P<i>\d+)\](?:\.(?P<gparam>\w+))?"
+                      r"|propellant\.tabs\[(?P<ti>\d+)\]\.(?P<tparam>\w+)"
+                      r"|propellant\.(?P<pparam>\w+)"
+                      r"|(?P<prop>propellant))$")
 
 
 def _unidade(p) -> tuple[str, float]:
@@ -371,10 +374,13 @@ def editar(motor, alteracoes) -> None:
     for chave, valor in alteracoes.items():
         m = _CAMINHO.match(chave.strip())
         if not m:
-            raise ToolError(f"Caminho inválido: {chave!r}. Use 'propellant', 'nozzle.<param>', "
+            raise ToolError(f"Caminho inválido: {chave!r}. Use 'propellant', 'propellant.a_factor', "
+                            "'propellant.density_kg_m3', 'propellant.tabs[i].<param>', 'nozzle.<param>', "
                             "'config.<param>', 'grains[i].<param>' ou 'grains[i]'")
         if m["prop"]:
             motor.propellant = _propelente(valor)
+        elif m["tparam"] or m["pparam"]:
+            _editar_propelente(motor, m, valor, chave)
         elif m["secao"]:
             _aplicar(getattr(motor, m["secao"]), {m["param"]: valor}, m["secao"])
         else:
@@ -391,6 +397,30 @@ def editar(motor, alteracoes) -> None:
                 motor.grains.append(_grao(valor, f"grains[{i}]"))
             else:
                 raise ToolError(f"{chave}: para acrescentar um grão use grains[{n}]")
+
+
+def _editar_propelente(motor, m, valor, chave: str) -> None:
+    """propellant.tabs[i].<param>, propellant.density_kg_m3 e propellant.a_factor (multiplica o 'a' da lei
+    r = a·Pⁿ em todas as faixas: o parâmetro natural para calibrar a velocidade de queima)."""
+    if motor.propellant is None:
+        raise ToolError(f"{chave}: o motor não tem propelente")
+    faixas = motor.propellant.props["tabs"].tabs
+    if m["tparam"]:
+        i = int(m["ti"])
+        if i >= len(faixas):
+            raise ToolError(f"{chave}: o propelente tem {len(faixas)} faixa(s), índices 0 a {len(faixas) - 1}")
+        _aplicar(faixas[i], {m["tparam"]: valor}, f"propellant.tabs[{i}]")
+    elif m["pparam"] == "a_factor":
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not valor > 0:
+            raise ToolError(f"{chave}: esperado um número > 0, recebido {valor!r}")
+        for i, faixa in enumerate(faixas):
+            p = faixa.props["a"]
+            novo = p.getValue() * valor
+            if not p.min <= novo <= p.max:
+                raise ToolError(f"{chave}: 'a' da faixa {i} ficaria {novo:g}, fora de [{p.min:g}, {p.max:g}]")
+            p.setValue(novo)
+    else:
+        _aplicar(motor.propellant, {m["pparam"]: valor}, "propellant")
 
 
 def alertas_geometria(motor) -> list[dict]:
@@ -481,3 +511,39 @@ def descrever(motor) -> dict:
         "nozzle": _valores(motor.nozzle),
         "config": _valores(motor.config),
     }
+
+
+# ------------------------------------------------------------------------------------- calibração
+
+def ler_caminho(motor, chave: str) -> float:
+    """Valor atual de um caminho de editar_motor (nas unidades externas). propellant.a_factor = 1."""
+    m = _CAMINHO.match(chave.strip())
+    if not m or m["prop"]:
+        raise ToolError(f"Caminho numérico inválido: {chave!r} (ex.: 'nozzle.efficiency', 'propellant.a_factor')")
+    try:
+        if m["tparam"]:
+            return _valores(motor.propellant.props["tabs"].tabs[int(m["ti"])])[m["tparam"]]
+        if m["pparam"] == "a_factor":
+            return 1.0
+        if m["pparam"]:
+            return _valores(motor.propellant)[m["pparam"]]
+        if m["secao"]:
+            return _valores(getattr(motor, m["secao"]))[m["param"]]
+        if m["gparam"]:
+            return _valores(motor.grains[int(m["i"])])[m["gparam"]]
+    except (KeyError, IndexError) as e:
+        raise ToolError(f"{chave}: parâmetro ou índice inexistente ({e})") from e
+    raise ToolError(f"{chave}: use um parâmetro numérico (ex.: 'grains[0].coreDiameter_mm')")
+
+
+def motor_de_dict(dados: dict) -> motorlib.motor.Motor:
+    return motorlib.motor.Motor(copy.deepcopy(dados))
+
+
+def curva_motor(r) -> dict:
+    """Curva simulada no formato de analise.comparar_curvas."""
+    import numpy as np
+
+    return {"t": np.array(r.channels["time"].getData(), float), "f": np.array(r.channels["force"].getData(), float),
+            "p": np.array(r.channels["pressure"].getData(), float),
+            "massa_propelente_kg": float(r.getPropellantMass()), "nome": r.getDesignation()}

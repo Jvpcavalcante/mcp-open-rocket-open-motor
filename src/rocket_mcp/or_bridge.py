@@ -24,7 +24,9 @@ _erro_inicio: BaseException | None = None
 
 def iniciar_em_segundo_plano(dir_motores: Path) -> None:
     """Sobe a JVM numa thread para o handshake MCP (initialize) responder na hora.
-    As tools do openMotor funcionam imediatamente; as do OpenRocket esperam em garantir()."""
+    As tools do openMotor funcionam imediatamente; as do OpenRocket esperam em garantir().
+    ARMADILHA (Windows): NÃO importe módulos com extensões nativas novas (ex.: matplotlib) enquanto a JVM
+    sobe; isso travou o processo (loader lock). Importações tardias desse tipo devem vir depois de garantir()."""
 
     def alvo():
         global _erro_inicio
@@ -182,17 +184,63 @@ def trocar_motor(doc, sim, motor, atraso_s: float, nome_montagem: str | None = N
 
 # Opções de voo aceitas por configurar() (os nomes são os argumentos de simular_voo e as chaves de opcoes_voo)
 OPCOES_VOO = ("trilho_m", "angulo_trilho_graus", "direcao_trilho_graus", "lancar_contra_vento", "vento_medio_ms",
-              "vento_direcao_graus", "turbulencia_pct", "altitude_lancamento_m", "latitude_graus", "longitude_graus",
-              "temperatura_c", "pressao_hpa", "semente")
+              "vento_direcao_graus", "turbulencia_pct", "perfil_vento", "perfil_vento_referencia",
+              "altitude_lancamento_m", "latitude_graus", "longitude_graus", "temperatura_c", "pressao_hpa", "semente")
+
+
+def _nivel_vento(n, i: int) -> tuple[float, float, float, float | None]:
+    """[altitude_m, velocidade_ms, direcao_graus(, turbulencia_pct)] ou o dict equivalente."""
+    onde = f"perfil_vento[{i}]"
+    if isinstance(n, dict):
+        desconhecidas = set(n) - {"altitude_m", "velocidade_ms", "direcao_graus", "turbulencia_pct"}
+        if desconhecidas:
+            raise ToolError(f"{onde}: chave(s) desconhecida(s) {sorted(desconhecidas)}")
+        n = [n.get("altitude_m"), n.get("velocidade_ms"), n.get("direcao_graus"), n.get("turbulencia_pct")]
+    if not isinstance(n, (list, tuple)) or len(n) not in (3, 4):
+        raise ToolError(f"{onde}: use [altitude_m, velocidade_ms, direcao_graus] (+ turbulencia_pct opcional)")
+    n = list(n) + [None] * (4 - len(n))
+    for valor, nome in zip(n[:3], ("altitude_m", "velocidade_ms", "direcao_graus")):
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            raise ToolError(f"{onde}.{nome}: esperado um número, recebido {valor!r}")
+    if n[3] is not None and (isinstance(n[3], bool) or not isinstance(n[3], (int, float)) or n[3] < 0):
+        raise ToolError(f"{onde}.turbulencia_pct: esperado um número >= 0, recebido {n[3]!r}")
+    if n[1] < 0:
+        raise ToolError(f"{onde}.velocidade_ms: não pode ser negativa")
+    return float(n[0]), float(n[1]), float(n[2]), None if n[3] is None else float(n[3])
+
+
+def _aplicar_perfil(o, perfil, referencia, turbulencia_pct) -> None:
+    from info.openrocket.core.models.wind import WindModel, WindModelType
+
+    if not isinstance(perfil, list) or not 1 <= len(perfil) <= 50:
+        raise ToolError("perfil_vento: informe de 1 a 50 níveis")
+    niveis = sorted(_nivel_vento(n, i) for i, n in enumerate(perfil))
+    if len({n[0] for n in niveis}) != len(niveis):
+        raise ToolError("perfil_vento: altitudes repetidas")
+    ref = str(referencia or "AGL").upper()
+    if ref not in ("AGL", "MSL"):
+        raise ToolError("perfil_vento_referencia: use 'AGL' (acima do solo) ou 'MSL' (acima do nível do mar)")
+    m = o.getMultiLevelWindModel()
+    m.clearLevels()
+    for alt, vel, dire, turb in niveis:
+        turb = turb if turb is not None else turbulencia_pct
+        if turb is None:
+            m.addWindLevel(alt, vel, math.radians(dire))  # turbulência padrão do OpenRocket
+        else:  # o 4º argumento é o desvio-padrão em m/s
+            m.addWindLevel(alt, vel, math.radians(dire), jpype.java.lang.Double(turb / 100 * vel))
+    m.setAltitudeReference(getattr(WindModel.AltitudeReference, ref))
+    o.setWindModelType(WindModelType.MULTI_LEVEL)
 
 
 def configurar(sim, *, trilho_m=None, angulo_trilho_graus=None, direcao_trilho_graus=None, lancar_contra_vento=None,
-               vento_medio_ms=None, vento_direcao_graus=None, turbulencia_pct=None, altitude_lancamento_m=None,
-               latitude_graus=None, longitude_graus=None, temperatura_c=None, pressao_hpa=None,
-               semente=None) -> list[str]:
+               vento_medio_ms=None, vento_direcao_graus=None, turbulencia_pct=None, perfil_vento=None,
+               perfil_vento_referencia=None, altitude_lancamento_m=None, latitude_graus=None, longitude_graus=None,
+               temperatura_c=None, pressao_hpa=None, semente=None) -> list[str]:
     """Ajusta as opções da simulação. Unidades do OpenRocket: SI e RADIANOS. Devolve notas para o LLM.
     ARMADILHA: com 'Launch into wind' ligado (padrão nos .ork testados, inclusive o Hemera), o OpenRocket
-    aponta o trilho contra o vento e IGNORA a direção do trilho. Informar direcao_trilho_graus desliga isso."""
+    aponta o trilho contra o vento e IGNORA a direção do trilho. Informar direcao_trilho_graus desliga isso.
+    ARMADILHA: os getters E setters de vento das SimulationOptions (getWindDirection, getWindSpeedAverage...)
+    trocam o modelo para o médio. Para ler sem efeito colateral, use o.getAverageWindModel()."""
     from info.openrocket.core.models.wind import WindModelType
 
     notas = []
@@ -208,7 +256,14 @@ def configurar(sim, *, trilho_m=None, angulo_trilho_graus=None, direcao_trilho_g
             notas.append("'Lançar contra o vento' desligado para valer a direção do trilho informada")
     if lancar_contra_vento is not None:
         o.setLaunchIntoWind(bool(lancar_contra_vento))
-    if any(v is not None for v in (vento_medio_ms, vento_direcao_graus, turbulencia_pct)):
+    if perfil_vento is not None:
+        if vento_medio_ms is not None or vento_direcao_graus is not None:
+            raise ToolError("Use perfil_vento OU vento_medio_ms/vento_direcao_graus, não os dois. "
+                            "turbulencia_pct, se informada, vale para os níveis sem turbulência própria.")
+        _aplicar_perfil(o, perfil_vento, perfil_vento_referencia, turbulencia_pct)
+    elif perfil_vento_referencia is not None:
+        raise ToolError("perfil_vento_referencia só vale junto com perfil_vento")
+    elif any(v is not None for v in (vento_medio_ms, vento_direcao_graus, turbulencia_pct)):
         if o.getWindModelType() != WindModelType.AVERAGE:
             # Os setters abaixo só valem no modelo de vento médio; no multinível seriam ignorados.
             o.setWindModelType(WindModelType.AVERAGE)
@@ -241,22 +296,34 @@ def condicoes_lancamento(sim) -> dict:
     from info.openrocket.core.models.wind import WindModelType
 
     o = sim.getOptions()
-    contra = bool(o.getLaunchIntoWind())
-    vento_dir = math.degrees(float(o.getWindDirection())) % 360
+    tipo = o.getWindModelType()  # ler ANTES de qualquer getter de vento das options (ver configurar)
     out = {
         "trilho_m": round(float(o.getLaunchRodLength()), 2),
         "angulo_trilho_graus": round(math.degrees(float(o.getLaunchRodAngle())), 1),
-        "lancar_contra_vento": contra,
-        # contra o vento, o trilho aponta para de onde o vento vem
-        "direcao_trilho_efetiva_graus": round(vento_dir if contra else
-                                              math.degrees(float(o.getLaunchRodDirection())) % 360, 1),
-        "modelo_vento": str(o.getWindModelType().name()),
+        "lancar_contra_vento": bool(o.getLaunchIntoWind()),
+        # getLaunchRodDirection() já resolve o 'contra o vento': direção do vento na altitude de lançamento
+        "direcao_trilho_efetiva_graus": round(math.degrees(float(o.getLaunchRodDirection())) % 360, 1),
+        "modelo_vento": str(tipo.name()),
         "altitude_lancamento_m": round(float(o.getLaunchAltitude()), 1),
         "atmosfera_isa": bool(o.isISAAtmosphere()),
     }
-    if o.getWindModelType() == WindModelType.AVERAGE:
-        out |= {"vento_medio_ms": round(float(o.getWindSpeedAverage()), 2), "vento_direcao_graus": round(vento_dir, 1),
-                "turbulencia_pct": round(float(o.getWindTurbulenceIntensity()) * 100, 1)}
+    if tipo == WindModelType.AVERAGE:
+        m = o.getAverageWindModel()  # getters do modelo, sem o efeito colateral dos das options
+        out |= {"vento_medio_ms": round(float(m.getAverage()), 2),
+                "vento_direcao_graus": round(math.degrees(float(m.getDirection())) % 360, 1),
+                "turbulencia_pct": round(float(m.getTurbulenceIntensity()) * 100, 1)}
+    else:
+        m = o.getMultiLevelWindModel()
+        out["perfil_vento_referencia"] = str(m.getAltitudeReference().name())
+        out["perfil_vento"] = [{"altitude_m": round(float(lv.getAltitude()), 1),
+                                "velocidade_ms": round(float(lv.getSpeed()), 2),
+                                "direcao_graus": round(math.degrees(float(lv.getDirection())) % 360, 1),
+                                # intensidade = desvio/velocidade: NaN num nível parado
+                                "turbulencia_pct": round(float(lv.getTurbulenceIntensity()) * 100, 1)
+                                if float(lv.getSpeed()) > 0 else 0.0}
+                               for lv in m.getLevels()]
+    if tipo != o.getWindModelType():
+        raise RuntimeError("condicoes_lancamento alterou o modelo de vento")  # proteção contra regressão
     return out
 
 
@@ -300,9 +367,118 @@ def _valor_em(t: list[float], v: list[float], instante: float | None) -> float |
     return next((vi for ti, vi in zip(t, v) if ti >= instante and vi == vi), None)
 
 
-def simular(sim) -> dict:
+_CLASSE_ARRASTO = []
+
+
+def listener_arrasto(fator: float):
+    """Listener que multiplica o CDaxial (o que o RK4 usa na força axial) por `fator`, preservando a
+    variação com o Mach. Implementado em Python via JPype: custa ~0,1-0,2 s a mais por voo no Hemera
+    (~2.400 chamadas). Com fator 1,0 o apogeu é idêntico ao sem listener."""
+    if not _CLASSE_ARRASTO:
+        J = jpype.JOverride
+
+        @jpype.JImplements("info.openrocket.core.simulation.listeners.SimulationComputationListener")
+        class FatorArrasto:
+            def __init__(self, f):
+                self.f = f
+
+            # Retornos null/NaN = "use o cálculo padrão" (como no AbstractSimulationListener)
+            @J
+            def startSimulation(self, s): pass
+            @J
+            def endSimulation(self, s, e): pass
+            @J
+            def preStep(self, s): return True
+            @J
+            def postStep(self, s): pass
+            @J
+            def isSystemListener(self): return False
+            @J
+            def clone(self): return self  # sem estado mutável
+            @J
+            def preAccelerationCalculation(self, s): return None
+            @J
+            def postAccelerationCalculation(self, s, a): return None
+            @J
+            def preAtmosphericModel(self, s): return None
+            @J
+            def postAtmosphericModel(self, s, c): return None
+            @J
+            def preWindModel(self, s): return None
+            @J
+            def postWindModel(self, s, c): return None
+            @J
+            def preGravityModel(self, s): return float("nan")
+            @J
+            def postGravityModel(self, s, g): return float("nan")
+            @J
+            def preFlightConditions(self, s): return None
+            @J
+            def postFlightConditions(self, s, c): return None
+            @J
+            def preAerodynamicCalculation(self, s): return None
+            @J
+            def postAerodynamicCalculation(self, s, forcas):
+                forcas.setCDaxial(forcas.getCDaxial() * self.f)
+                return forcas
+            @J
+            def preMassCalculation(self, s): return None
+            @J
+            def postMassCalculation(self, s, r): return None
+            @J
+            def preSimpleThrustCalculation(self, s): return float("nan")
+            @J
+            def postSimpleThrustCalculation(self, s, t): return float("nan")
+
+        _CLASSE_ARRASTO.append(FatorArrasto)
+    return _CLASSE_ARRASTO[0](float(fator))
+
+
+def escalar_impulso(doc, sim, fator: float) -> None:
+    """Troca o motor de cada montagem ativa por uma cópia com a curva de empuxo × fator (mesma queima e
+    massas). A cópia não entra no banco de motores."""
+    from info.openrocket.core.motor import ThrustCurveMotor
+
+    fcid = sim.getFlightConfigurationId()
+    for m in montagens(doc, sim):
+        mc = m["componente"].getMotorConfig(fcid)
+        motor = mc.getMotor()
+        if motor is None or not isinstance(motor, ThrustCurveMotor):
+            continue
+        b = ThrustCurveMotor.Builder()
+        b.setManufacturer(motor.getManufacturer())
+        b.setDesignation(f"{motor.getDesignation()}x{fator:.4f}")
+        b.setDiameter(motor.getDiameter())
+        b.setLength(motor.getLength())
+        b.setTimePoints(motor.getTimePoints())
+        b.setThrustPoints(jpype.JArray(jpype.JDouble)([float(x) * fator for x in motor.getThrustPoints()]))
+        b.setCGPoints(motor.getCGPoints())
+        b.setInitialMass(motor.getInitialMass())
+        b.setStandardDelays(motor.getStandardDelays())
+        mc.setMotor(b.build())
+
+
+def escalar_massa(doc, sim, fator: float) -> None:
+    """Massa estrutural (sem motor) × fator, mantendo o CG: sobrescreve a massa e o CG do estágio
+    incluindo os filhos. Só para foguete de um estágio."""
+    from info.openrocket.core.masscalc import MassCalculator
+
+    rocket = doc.getRocket()
+    if rocket.getChildCount() != 1:
+        raise ToolError("A incerteza de massa ainda não suporta foguetes com mais de um estágio")
+    estagio = rocket.getChild(0)
+    estrutura = MassCalculator.calculateStructure(rocket.getFlightConfiguration(sim.getFlightConfigurationId()))
+    estagio.setOverrideMass(float(estrutura.getMass()) * fator)
+    estagio.setMassOverridden(True)
+    estagio.setSubcomponentsOverriddenMass(True)
+    estagio.setOverrideCGX(float(estrutura.getCM().x) - float(estagio.getAxialFront()))
+    estagio.setCGOverridden(True)
+    estagio.setSubcomponentsOverriddenCG(True)
+
+
+def simular(sim, listeners: tuple = ()) -> dict:
     with LOCK:
-        sim.simulate()
+        sim.simulate(*listeners)
         d = sim.getSimulatedData()
         out = {
             "apogeu_m": round(float(d.getMaxAltitude()), 1),
@@ -363,12 +539,108 @@ def alertas_projeto(res: dict, atraso_ejecao_s: float | None = None) -> list[str
         a.append(f"Margem estática {margem} cal (> 3 cal): sobre-estável, sensível a vento (weathercocking)")
     if res.get("mach_max", 0) > 0.8:
         a.append(f"Mach máximo {res['mach_max']} (> 0,8): regime transônico, arrasto e estabilidade menos precisos")
+    seg = res.get("seguranca", {})
+    if seg.get("empuxo_peso_medio") is not None and seg["empuxo_peso_medio"] < 5:
+        a.append(f"Empuxo/peso médio {seg['empuxo_peso_medio']} (< 5): decolagem lenta, sensível a vento")
+    for f in seg.get("flutter") or []:
+        if isinstance(f, dict) and f.get("fator_min") is not None and f["fator_min"] < 1.5:
+            a.append(f"Flutter em '{f['aletas']}': velocidade de flutter só {f['fator_min']}× a de voo em "
+                     f"t={f['t_s']} s (recomendado ≥ 1,5×)")
+    if seg.get("descida"):
+        final = seg["descida"][-1]
+        if final["velocidade_ms"] > 9:
+            a.append(f"Descida final a {final['velocidade_ms']} m/s após '{final['apos_abertura']}' (> 9 m/s, "
+                     "limite comum em competições)")
     otimo = res.get("atraso_otimo_s")
     if atraso_ejecao_s is not None and otimo and abs(atraso_ejecao_s - otimo) > 1.5:
         quando = "antes" if atraso_ejecao_s < otimo else "depois"
         a.append(f"Atraso de ejeção {atraso_ejecao_s} s abre a recuperação ~{abs(atraso_ejecao_s - otimo):.1f} s "
                  f"{quando} do apogeu (ótimo {otimo} s), se ela usa a carga do motor")
     return a
+
+
+# Módulo de cisalhamento (GPa) só de metais, com valores bem estabelecidos. Compósitos e madeira variam
+# demais com laminação/umidade: o usuário informa o valor medido ou do fornecedor.
+MATERIAIS_ALETA_GPA = {"aluminio": 26.0, "aco": 79.3, "titanio": 44.0}
+G0 = 9.80665
+
+
+def _flutter(cr, ct, h, esp, g_pa, a, p):
+    """Velocidade de flutter (m/s) de uma aleta trapezoidal: NACA TN-4197 (Martin, 1958), forma usual
+    Vf = a·√(G / (39,3·AR³/((t/c)³(AR+2)) · (λ+1)/2 · p/p0)), com G em psi e p/p0 adimensional.
+    ATENÇÃO: a versão publicada no Peak of Flight #291 (Apogee) dá Vf √2 MAIOR. A constante 1,337 =
+    39,3/(2·14,696) já absorve o ½ de (λ+1)/2, e a expressão ainda divide por 2·(AR+2). Usamos a da NACA,
+    mais conservadora. Ver tests/test_seguranca.py."""
+    area = (cr + ct) / 2 * h
+    ar = h * h / area  # alongamento
+    lam = ct / cr
+    tc = esp / cr
+    g_psi = g_pa / 6894.757
+    den = 39.3 * ar ** 3 / (tc ** 3 * (ar + 2)) * (lam + 1) / 2 * (p / 101325.0)
+    return a * math.sqrt(g_psi / den)
+
+
+def seguranca(doc, sim, g_aletas_pa: float | None = None) -> dict:
+    """Números de segurança/estrutura a partir do voo já simulado (ramo principal)."""
+    from info.openrocket.core.rocketcomponent import TrapezoidFinSet
+    from info.openrocket.core.simulation import FlightEvent
+
+    with LOCK:
+        ramo = sim.getSimulatedData().getBranch(0)
+        t = _dados(ramo, "TYPE_TIME")
+        v, vz = _dados(ramo, "TYPE_VELOCITY_TOTAL"), _dados(ramo, "TYPE_VELOCITY_Z")
+        rho, p, a = _dados(ramo, "TYPE_AIR_DENSITY"), _dados(ramo, "TYPE_AIR_PRESSURE"), _dados(ramo, "TYPE_SPEED_OF_SOUND")
+        empuxo, massa, acel = _dados(ramo, "TYPE_THRUST_FORCE"), _dados(ramo, "TYPE_MASS"), _dados(ramo, "TYPE_ACCELERATION_TOTAL")
+        t_trilho, t_apogeu = _tempo_evento(ramo, "LAUNCHROD"), _tempo_evento(ramo, "APOGEE")
+        t_queima, t_solo = _tempo_evento(ramo, "BURNOUT"), _tempo_evento(ramo, "GROUND_HIT")
+        aberturas = [(float(e.getTime()), str(e.getSource().getName()).strip() if e.getSource() else "?")
+                     for e in ramo.getEvents() if e.getType() == FlightEvent.Type.RECOVERY_DEVICE_DEPLOYMENT]
+        aletas = [(str(c.getName()).strip(), float(c.getRootChord()), float(c.getTipChord()), float(c.getHeight()),
+                   float(c.getThickness())) for c in doc.getRocket() if isinstance(c, TrapezoidFinSet)]
+        v_impacto = float(sim.getSimulatedData().getGroundHitVelocity())
+
+    def r(x, n):
+        return None if x is None or x != x else round(x, n)
+
+    n = len(t)
+    t_apo = t_apogeu if t_apogeu is not None else t[-1]
+    subida = [i for i in range(n) if t[i] <= t_apo]
+    q = [0.5 * rho[i] * v[i] ** 2 for i in range(n)]
+    iq = max(subida, key=q.__getitem__)
+    out = {"q_max_kpa": r(q[iq] / 1000, 1), "t_q_max_s": r(t[iq], 2), "mach_q_max": r(v[iq] / a[iq], 3),
+           "aceleracao_max_subida_g": r(max(acel[i] for i in subida) / G0, 1)}
+    recup = [i for i in range(n) if t[i] > t_apo and acel[i] == acel[i]]
+    if recup:
+        ir = max(recup, key=acel.__getitem__)
+        out |= {"aceleracao_max_recuperacao_g": r(acel[ir] / G0, 1), "t_aceleracao_max_recuperacao_s": r(t[ir], 2)}
+    # empuxo/peso: médio na queima e na saída do trilho
+    if t_queima:
+        queima = [i for i in range(n) if t[i] <= t_queima]
+        out["empuxo_peso_medio"] = r(sum(empuxo[i] for i in queima) / len(queima) / (massa[0] * G0), 1)
+    if t_trilho is not None:
+        it = next(i for i in range(n) if t[i] >= t_trilho)
+        out["empuxo_peso_saida_trilho"] = r(empuxo[it] / (massa[it] * G0), 1)
+    # descida: velocidade "terminal" de cada fase = média de |vz| no último quarto do intervalo
+    fins_fase = [ab[0] for ab in aberturas[1:]] + [t_solo if t_solo is not None else t[-1]]
+    descida = []
+    for (t0, nome), t1 in zip(aberturas, fins_fase):
+        janela = [abs(vz[i]) for i in range(n) if t0 + 0.75 * (t1 - t0) <= t[i] <= t1]
+        if janela:
+            descida.append({"apos_abertura": nome, "t_s": r(t0, 1), "velocidade_ms": r(sum(janela) / len(janela), 2)})
+    out["descida"] = descida
+    out["velocidade_impacto_ms"] = r(v_impacto, 2)
+    out["energia_impacto_j"] = r(0.5 * massa[-1] * v_impacto ** 2, 0)
+    # flutter: menor razão Vflutter/V na subida, para cada conjunto de aletas trapezoidais
+    if g_aletas_pa is None:
+        out["flutter"] = {"nota": "informe material_aletas (aluminio, aco, titanio) ou modulo_cisalhamento_aletas_gpa"}
+    else:
+        out["flutter"] = []
+        for nome, cr, ct, h, esp in aletas:
+            pares = [(_flutter(cr, ct, h, esp, g_aletas_pa, a[i], p[i]) / v[i], i) for i in subida if v[i] > 1]
+            fator, i = min(pares)
+            out["flutter"].append({"aletas": nome, "fator_min": r(fator, 2), "t_s": r(t[i], 2),
+                                   "velocidade_flutter_ms": r(fator * v[i], 1), "velocidade_ms": r(v[i], 1)})
+    return out
 
 
 # Séries exportadas por exportar_series_voo: (coluna, FlightDataType, fator)

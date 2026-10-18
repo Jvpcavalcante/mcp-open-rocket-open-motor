@@ -6,15 +6,18 @@ import functools
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import anyio
 import anyio.from_thread
 import jpype
+import numpy as np
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import analise as an
 from . import om_bridge as om
 from . import or_bridge as orb
 from . import or_foguete as of
@@ -33,7 +36,10 @@ mcp = MCPServer(
         "simular_voo (ou projetar_e_voar para tudo de uma vez). Para projetar um motor: "
         "listar_tipos_grao -> criar_motor -> editar_motor (simular=True) até atender aos requisitos. "
         "Para o foguete: ler_foguete -> editar_foguete (grava em arquivo novo) -> simular_voo; "
-        "varrer_parametro compara vários valores de um parâmetro; exportar_series_* gera CSV."
+        "varrer_parametro compara vários valores de um parâmetro; otimizar_parametro busca o valor que atinge "
+        "uma meta; analisar_dispersao estima o risco (Monte Carlo); exportar_series_* gera CSV. "
+        "Com dados reais: comparar_curvas_empuxo, calibrar_motor (ensaio estático) e calibrar_voo (log do "
+        "altímetro; os fatores achados entram em simular_voo/opcoes_voo). gerar_relatorio produz um HTML."
     ),
 )
 
@@ -146,17 +152,50 @@ def _simulacao(doc, indice: int):
     return doc.getSimulations().get(indice)
 
 
+# Fatores de modelo (calibração/dispersão): não são opções do OpenRocket, o _voar os aplica por fora
+FATORES_VOO = ("fator_arrasto", "fator_impulso", "fator_massa")
+OPCOES_TODAS = orb.OPCOES_VOO + FATORES_VOO
+
+
 def _opcoes_voo(opcoes: dict | None) -> dict:
     """opcoes_voo de varrer_parametro/exportar_series_voo: mesmos nomes dos argumentos de simular_voo."""
     opcoes = {"semente": 0} | (opcoes or {})
-    desconhecidas = sorted(set(opcoes) - set(orb.OPCOES_VOO))
+    desconhecidas = sorted(set(opcoes) - set(OPCOES_TODAS))
     if desconhecidas:
-        raise ToolError(f"opcoes_voo: chave(s) desconhecida(s) {desconhecidas}. Aceitas: {list(orb.OPCOES_VOO)}")
+        raise ToolError(f"opcoes_voo: chave(s) desconhecida(s) {desconhecidas}. Aceitas: {list(OPCOES_TODAS)}")
+    for k in FATORES_VOO:
+        v = opcoes.get(k)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.1 <= v <= 10):
+            raise ToolError(f"{k}: esperado um número entre 0,1 e 10, recebido {v!r}")
     return opcoes
 
 
-def _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes: dict, avisos_carga: list) -> dict:
-    """Troca o motor (opcional), aplica as opções, simula e junta estabilidade e alertas de projeto."""
+def _g_aletas(material: str | None, gpa: float | None) -> float | None:
+    """Módulo de cisalhamento das aletas em Pa, de um material da tabela ou do valor informado."""
+    if material is not None and gpa is not None:
+        raise ToolError("Informe material_aletas OU modulo_cisalhamento_aletas_gpa")
+    if material is not None:
+        chave = material.strip().lower().replace("í", "i").replace("ç", "c")
+        if chave not in orb.MATERIAIS_ALETA_GPA:
+            raise ToolError(f"material_aletas '{material}' fora da tabela {list(orb.MATERIAIS_ALETA_GPA)}. "
+                            "Para compósitos e madeira, informe modulo_cisalhamento_aletas_gpa (medido ou do "
+                            "fornecedor): o valor varia muito com a laminação.")
+        return orb.MATERIAIS_ALETA_GPA[chave] * 1e9
+    if gpa is not None:
+        if isinstance(gpa, bool) or not isinstance(gpa, (int, float)) or gpa <= 0:
+            raise ToolError("modulo_cisalhamento_aletas_gpa: esperado um número > 0")
+        return float(gpa) * 1e9
+    return None
+
+
+def _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes: dict, avisos_carga: list,
+          g_aletas_pa: float | None = None, fatores: dict | None = None) -> dict:
+    """Troca o motor (opcional), aplica as opções, simula e junta estabilidade, segurança e alertas.
+    fatores: {'massa': f, 'impulso': f, 'arrasto': f} multiplicativos (análise de dispersão); são
+    combinados com fator_* das opções (valores calibrados)."""
+    opcoes = dict(opcoes)
+    fatores = {k: (fatores or {}).get(k, 1.0) * (opcoes.pop(f"fator_{k}", None) or 1.0)
+               for k in ("massa", "impulso", "arrasto")}
     avisos_val = []
     if motor_eng:
         eng = _caminho(motor_eng)
@@ -166,11 +205,19 @@ def _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes: dict, avisos_c
         avisos_val = orb.trocar_motor(doc, sim, motor, atraso_ejecao_s or 0.0, montagem)
     notas = orb.configurar(sim, **opcoes)
     with orb.LOCK:
+        if fatores.get("impulso", 1.0) != 1.0:
+            orb.escalar_impulso(doc, sim, fatores["impulso"])
+        if fatores.get("massa", 1.0) != 1.0:
+            orb.escalar_massa(doc, sim, fatores["massa"])
         estabilidade = of.estabilidade_estatica(doc, sim)  # depois da troca: o motor entra no CG
         lancamento = orb.condicoes_lancamento(sim)
-    res = orb.simular(sim) | {"estabilidade": estabilidade, "lancamento": lancamento}
+    listeners = (orb.listener_arrasto(fatores["arrasto"]),) if fatores.get("arrasto", 1.0) != 1.0 else ()
+    res = orb.simular(sim, listeners) | {"estabilidade": estabilidade, "lancamento": lancamento}
+    res["seguranca"] = orb.seguranca(doc, sim, g_aletas_pa)
     res |= {"avisos_validacao": avisos_val, "avisos_carregamento": avisos_carga}
     res["alertas_projeto"] = orb.alertas_projeto(res, atraso_ejecao_s)
+    if any(f != 1.0 for f in fatores.values()):
+        res["fatores_modelo"] = {k: round(v, 4) for k, v in fatores.items()}
     if notas:
         res["notas"] = notas
     return res
@@ -209,14 +256,22 @@ def simular_voo(arquivo_ork: str, indice_simulacao: int = 0, motor_eng: str | No
                 direcao_trilho_graus: float | None = None, lancar_contra_vento: bool | None = None,
                 vento_medio_ms: float | None = None,
                 vento_direcao_graus: float | None = None, turbulencia_pct: float | None = None,
+                perfil_vento: list[Any] | None = None, perfil_vento_referencia: str | None = None,
                 altitude_lancamento_m: float | None = None, latitude_graus: float | None = None,
                 longitude_graus: float | None = None, temperatura_c: float | None = None,
                 pressao_hpa: float | None = None, semente: int | None = 0,
+                material_aletas: str | None = None, modulo_cisalhamento_aletas_gpa: float | None = None,
+                fator_arrasto: float | None = None, fator_impulso: float | None = None,
+                fator_massa: float | None = None,
                 salvar_como: str | None = None, sobrescrever: bool = False) -> dict:
     """Simula o voo de uma simulação do .ork. Opcionalmente troca o motor por um .eng
     (caminho no workspace, ex.: 'motores/F46-OM.eng') e ajusta o lançamento: trilho (comprimento, ângulo
     com a vertical, direção para onde APONTA), vento (médio, turbulência e direção de onde VEM: 90 = vento
     de leste), local (altitude, latitude, longitude) e atmosfera (temperatura e pressão; sem elas usa a ISA).
+    perfil_vento: vento por altitude (o OpenRocket interpola entre os níveis), no lugar de vento_medio_ms:
+      [[altitude_m, velocidade_ms, direcao_graus], ...] ou com turbulencia_pct como 4º valor; também aceita
+      [{"altitude_m":..., "velocidade_ms":..., "direcao_graus":..., "turbulencia_pct":...}].
+      perfil_vento_referencia: 'AGL' (acima do solo, padrão) ou 'MSL'.
     lancar_contra_vento: com True o OpenRocket aponta o trilho contra o vento e ignora a direção do trilho
     (vem ligado em muitos .ork); informar direcao_trilho_graus desliga isso. 'lancamento' na resposta
     mostra as condições efetivas usadas.
@@ -224,19 +279,32 @@ def simular_voo(arquivo_ork: str, indice_simulacao: int = 0, motor_eng: str | No
     Para comparar vários ventos ou ângulos de trilho numa chamada: varrer_parametro.
     Retorna apogeu, velocidades, Mach, atraso ótimo, estabilidade (margem estática e estabilidade em voo:
     saída do trilho e mínima na subida), ponto de pouso (distância e rumo a partir da base; 0 = norte),
-    massas, alertas de projeto e avisos do OpenRocket.
+    massas, alertas de projeto e avisos do OpenRocket, e 'seguranca': pressão dinâmica máxima, aceleração
+    máxima na subida e na recuperação (choque de abertura), empuxo/peso, velocidade de descida por fase,
+    energia no impacto e, com material_aletas ('aluminio', 'aco', 'titanio') ou
+    modulo_cisalhamento_aletas_gpa (compósitos/madeira: valor medido), a margem de flutter das aletas
+    trapezoidais (NACA TN-4197; recomendado ≥ 1,5×).
+    fator_arrasto/fator_impulso/fator_massa: multiplicadores de modelo (ex.: o fator de arrasto achado por
+    calibrar_voo); o arrasto é escalado preservando a variação com o Mach.
     O .ork original não é alterado; salvar_como grava o resultado em arquivo novo."""
+    if salvar_como and any(f not in (None, 1, 1.0) for f in (fator_arrasto, fator_impulso, fator_massa)):
+        raise ToolError("salvar_como não combina com fator_*: os fatores são do modelo do MCP e alterariam o "
+                        "foguete gravado (massa sobrescrita, motor escalado)")
     destino = _destino_novo(salvar_como, ".ork", sobrescrever) if salvar_como else None  # valida antes
-    doc, avisos = _carregar(arquivo_ork)
-    sim = _simulacao(doc, indice_simulacao)
-    opcoes = dict(trilho_m=trilho_m, angulo_trilho_graus=angulo_trilho_graus,
+    g_aletas = _g_aletas(material_aletas, modulo_cisalhamento_aletas_gpa)
+    opcoes = _opcoes_voo(dict(
+                  fator_arrasto=fator_arrasto, fator_impulso=fator_impulso, fator_massa=fator_massa,
+                  trilho_m=trilho_m, angulo_trilho_graus=angulo_trilho_graus,
                   direcao_trilho_graus=direcao_trilho_graus, lancar_contra_vento=lancar_contra_vento,
                   vento_medio_ms=vento_medio_ms,
                   vento_direcao_graus=vento_direcao_graus, turbulencia_pct=turbulencia_pct,
+                  perfil_vento=perfil_vento, perfil_vento_referencia=perfil_vento_referencia,
                   altitude_lancamento_m=altitude_lancamento_m, latitude_graus=latitude_graus,
                   longitude_graus=longitude_graus, temperatura_c=temperatura_c, pressao_hpa=pressao_hpa,
-                  semente=semente)
-    res = _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes, avisos)
+                  semente=semente))
+    doc, avisos = _carregar(arquivo_ork)
+    sim = _simulacao(doc, indice_simulacao)
+    res = _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes, avisos, g_aletas)
     if destino:
         orb.salvar_ork(doc, destino)
         res["arquivo_salvo"] = _rel(destino)
@@ -327,7 +395,8 @@ def varrer_parametro(arquivo_ork: str, parametro: str, valores: list[Any], indic
       - uma condição de lançamento, com o nome do argumento de simular_voo: 'vento_medio_ms',
         'vento_direcao_graus', 'turbulencia_pct', 'angulo_trilho_graus', 'direcao_trilho_graus',
         'trilho_m', 'altitude_lancamento_m', 'temperatura_c', 'pressao_hpa'... Com 'semente' e
-        turbulência em opcoes_voo, vira uma estimativa de dispersão por rajadas;
+        turbulência em opcoes_voo, vira uma estimativa de dispersão por rajadas; com 'perfil_vento', cada
+        valor é um perfil inteiro (comparar sondagens);
       - um parâmetro do foguete, no formato de editar_foguete ('Fins.span_mm', 'Payload 2U.mass_kg').
     Convenções (verificadas): vento_direcao_graus é de onde o vento VEM (90 = vento de leste, o foguete
     deriva para oeste); direcao_trilho_graus é para onde o trilho APONTA; ângulo do trilho medido da vertical.
@@ -338,12 +407,18 @@ def varrer_parametro(arquivo_ork: str, parametro: str, valores: list[Any], indic
     if not isinstance(valores, list) or not 1 <= len(valores) <= 25:
         raise ToolError("valores: informe de 1 a 25 valores")
     opcoes = _opcoes_voo(opcoes_voo)
-    condicao = parametro.strip() in orb.OPCOES_VOO
+    condicao = parametro.strip() in OPCOES_TODAS
     if condicao:
         for v in valores:  # valida antes de simular qualquer linha
             if parametro.strip() == "lancar_contra_vento":
                 if not isinstance(v, bool):
                     raise ToolError(f"{parametro}: esperado true/false, recebido {v!r}")
+            elif parametro.strip() == "perfil_vento":  # comparar sondagens/perfis
+                if not isinstance(v, list):
+                    raise ToolError(f"{parametro}: cada valor deve ser um perfil (lista de níveis)")
+            elif parametro.strip() == "perfil_vento_referencia":
+                if v not in ("AGL", "MSL"):
+                    raise ToolError(f"{parametro}: use 'AGL' ou 'MSL'")
             elif isinstance(v, bool) or not isinstance(v, (int, float)) and not (v is None and parametro == "semente"):
                 raise ToolError(f"{parametro}: esperado um número, recebido {v!r}")
     linhas, efeitos, nome_sim = [], [], None
@@ -371,6 +446,254 @@ def varrer_parametro(arquivo_ork: str, parametro: str, valores: list[Any], indic
     return {"parametro": parametro, "tipo": "condicao_lancamento" if condicao else "foguete",
             "simulacao": nome_sim, "linhas": linhas,
             "efeitos": list(dict.fromkeys(e for e in efeitos if not e.startswith("O OpenRocket ajustou")))}
+
+
+def _avaliador_voo(arquivo_ork, parametro, indice_simulacao, motor_eng, atraso_ejecao_s, montagem, opcoes,
+                   metrica):
+    """f(valor) -> métrica, recarregando o .ork a cada avaliação (o documento é mutável)."""
+    condicao = parametro.strip() in OPCOES_TODAS
+    estatica = metrica in an.METRICAS_ESTATICAS and not condicao
+
+    def f(v):
+        doc, _ = _carregar(arquivo_ork)
+        sim = _simulacao(doc, indice_simulacao)
+        if condicao:
+            return an.METRICAS_VOO[metrica](
+                _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes | {parametro.strip(): v}, []))
+        with orb.LOCK:
+            of.editar(doc, sim, {parametro: v})
+        if not estatica:
+            return an.METRICAS_VOO[metrica](_voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes, []))
+        if motor_eng:  # o motor entra no CG
+            orb.trocar_motor(doc, sim, orb.registrar_motor(_caminho(motor_eng)), atraso_ejecao_s or 0.0, montagem)
+        with orb.LOCK:
+            return an.METRICAS_VOO[metrica]({"estabilidade": of.estabilidade_estatica(doc, sim)})
+
+    return f
+
+
+def _avaliador_motor(arquivo_ric, parametro, metrica):
+    origem = _ric_existente(arquivo_ric)
+
+    def f(v):
+        with orb.LOCK:
+            motor = om.carregar_ric(origem)
+            om.editar(motor, {parametro: v})
+            om.validar(motor)
+            res = om.resumo(motor, om.simular(motor))
+        if not res["sucesso"]:
+            raise ToolError(f"Simulação do motor falhou com {parametro}={v}: {res['alertas']}")
+        return res[metrica]
+
+    return f
+
+
+@mcp.tool()
+@_erros_java
+def otimizar_parametro(parametro: str, minimo: float, maximo: float, metrica: str, meta: float | str,
+                       arquivo_ork: str | None = None, arquivo_ric: str | None = None, indice_simulacao: int = 0,
+                       motor_eng: str | None = None, atraso_ejecao_s: float | None = None,
+                       montagem: str | None = None, opcoes_voo: dict[str, Any] | None = None,
+                       tolerancia: float | None = None, max_avaliacoes: int = 20,
+                       salvar_como: str | None = None, sobrescrever: bool = False) -> dict:
+    """Procura o valor de UM parâmetro, entre minimo e maximo, que leva uma métrica a uma meta.
+    meta: um número (ex.: 1.5 para margem de 1,5 cal) ou "min"/"max" (ex.: deriva mínima).
+    Foguete (arquivo_ork): parametro como em editar_foguete ('Payload Module/Lastro.mass_kg',
+      'Fins.span_mm') ou uma condição de lançamento ('angulo_trilho_graus'); métricas: apogeu_m,
+      velocidade_max_ms, mach_max, velocidade_saida_trilho_ms, margem_estatica_cal (rápida, sem simular),
+      estabilidade_saida_trilho_cal, estabilidade_min_subida_cal, distancia_pouso_m, massa_decolagem_kg,
+      velocidade_abertura_recuperacao_ms, velocidade_impacto_ms, tempo_voo_s...
+    Motor (arquivo_ric): parametro como em editar_motor ('nozzle.throat_mm', 'grains[0].coreDiameter_mm');
+      métricas: pressao_max_MPa, impulso_total_Ns, empuxo_medio_N, tempo_queima_s, isp_s, kn_pico...
+    Meta numérica usa bisseção: a métrica precisa cruzar a meta no intervalo (senão a resposta mostra o
+    alcance). "min"/"max" usa malha + seção áurea. tolerancia: na unidade da métrica (padrão 0,1% da meta).
+    salvar_como grava o resultado em arquivo NOVO (.ork ou .ric). Devolve o valor, a métrica e o histórico."""
+    if (arquivo_ork is None) == (arquivo_ric is None):
+        raise ToolError("Informe arquivo_ork (foguete/voo) OU arquivo_ric (motor)")
+    if not minimo < maximo:
+        raise ToolError("minimo precisa ser menor que maximo")
+    if not 3 <= max_avaliacoes <= 40:
+        raise ToolError("max_avaliacoes: de 3 a 40")
+    metricas = an.METRICAS_MOTOR if arquivo_ric else tuple(an.METRICAS_VOO)
+    if metrica not in metricas:
+        raise ToolError(f"metrica '{metrica}' inválida. Opções: {list(metricas)}")
+    if isinstance(meta, str) and meta not in ("min", "max"):
+        raise ToolError("meta: um número, 'min' ou 'max'")
+    ext = ".ric" if arquivo_ric else ".ork"
+    if salvar_como and parametro.strip() in FATORES_VOO:
+        raise ToolError(f"{parametro} é um fator de modelo do MCP e não cabe no .ork: use o valor encontrado "
+                        "em opcoes_voo/simular_voo, sem salvar_como")
+    destino = _destino_novo(salvar_como, ext, sobrescrever) if salvar_como else None
+    if arquivo_ric:
+        f = _avaliador_motor(arquivo_ric, parametro, metrica)
+    else:
+        f = _avaliador_voo(arquivo_ork, parametro, indice_simulacao, motor_eng, atraso_ejecao_s, montagem,
+                           _opcoes_voo(opcoes_voo), metrica)
+    if isinstance(meta, str):
+        r = an.buscar_extremo(f, minimo, maximo, meta == "max", max_avaliacoes)
+    else:
+        r = an.buscar_meta(f, minimo, maximo, float(meta), tolerancia, max_avaliacoes)
+    out = {"parametro": parametro, "metrica": metrica, "meta": meta, "valor_otimo": r["valor"],
+           "metrica_no_otimo": r["metrica"], "convergiu": r["convergiu"], "mensagem": r["mensagem"],
+           "avaliacoes": len(r["historico"]), "historico": r["historico"]}
+    if destino:
+        if arquivo_ric:
+            with orb.LOCK:
+                motor = om.carregar_ric(_ric_existente(arquivo_ric))
+                om.editar(motor, {parametro: r["valor"]})
+                om.salvar_ric(motor, destino)
+        else:
+            doc, _ = _carregar(arquivo_ork)
+            sim = _simulacao(doc, indice_simulacao)
+            if parametro.strip() in OPCOES_TODAS:
+                orb.configurar(sim, **{parametro.strip(): r["valor"]})
+            else:
+                with orb.LOCK:
+                    of.editar(doc, sim, {parametro: r["valor"]})
+            orb.salvar_ork(doc, destino)
+        out["arquivo_salvo"] = _rel(destino)
+    return out
+
+
+INCERTEZAS_PADRAO = {"vento_ms": 2.0, "vento_direcao_graus": 30.0, "angulo_trilho_graus": 1.0,
+                     "massa_pct": 2.0, "arrasto_pct": 5.0, "impulso_pct": 3.0}
+
+
+@mcp.tool()
+async def analisar_dispersao(arquivo_ork: str, ctx: Context, n_voos: int = 50, indice_simulacao: int = 0,
+                             motor_eng: str | None = None, atraso_ejecao_s: float | None = None,
+                             montagem: str | None = None, opcoes_voo: dict[str, Any] | None = None,
+                             incertezas: dict[str, float] | None = None, semente: int = 0,
+                             material_aletas: str | None = None,
+                             modulo_cisalhamento_aletas_gpa: float | None = None,
+                             arquivo_csv: str | None = None, sobrescrever: bool = False) -> dict:
+    """Análise de dispersão (Monte Carlo): simula n_voos (5 a 200) sorteando as incertezas em torno das
+    condições nominais (as do .ork + opcoes_voo) e devolve estatísticas (média, desvio, p5/p50/p95, pior
+    caso) de apogeu, velocidades, estabilidade e deriva; a elipse de pouso de 95%; a probabilidade de cada
+    problema (estabilidade < 1 cal, saída do trilho < 15 m/s...); e os piores voos.
+    incertezas (1 desvio-padrão, distribuição normal; 0 desliga), padrões: vento_ms 2, vento_direcao_graus 30,
+      angulo_trilho_graus 1, massa_pct 2 (massa estrutural, CG mantido), arrasto_pct 5 (fator no Cd, que
+      preserva a variação com o Mach), impulso_pct 3 (curva de empuxo escalada). Cada voo também tem uma
+      realização própria da turbulência. Com perfil de vento, vento_ms soma em todos os níveis.
+    semente fixa todos os sorteios: a mesma chamada dá o mesmo resultado. arquivo_csv grava todos os voos.
+    Leva ~0,5-1 s por voo no Hemera; o progresso é notificado."""
+    sig, opcoes, sorteios = _preparar_dispersao(n_voos, incertezas, opcoes_voo, semente)
+    g_aletas = _g_aletas(material_aletas, modulo_cisalhamento_aletas_gpa)
+    destino_csv = _destino_novo(arquivo_csv, ".csv", sobrescrever) if arquivo_csv else None
+
+    def trabalho():
+        return _rodar_dispersao(arquivo_ork, indice_simulacao, motor_eng, atraso_ejecao_s, montagem, opcoes,
+                                sorteios, semente, g_aletas,
+                                lambda i: anyio.from_thread.run(ctx.report_progress, i, n_voos))
+
+    voos, nominal, avisos, duracao = await anyio.to_thread.run_sync(_erros_java(trabalho))
+    out = _resumir_dispersao(voos, nominal, avisos, duracao, semente, sig)
+    if destino_csv:
+        colunas = [k for k in voos[0] if k != "alertas"] + ["alertas"]
+        with destino_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(colunas)
+            for v in voos:
+                w.writerow([*(v[k] for k in colunas[:-1]), " | ".join(v["alertas"])])
+        out["arquivo_csv"] = _rel(destino_csv)
+    return out
+
+
+def _preparar_dispersao(n_voos, incertezas, opcoes_voo, semente) -> tuple[dict, dict, list[dict]]:
+    """Valida e sorteia tudo antes de simular (a mesma semente dá os mesmos sorteios)."""
+    if isinstance(n_voos, bool) or not isinstance(n_voos, int) or not 5 <= n_voos <= 200:
+        raise ToolError("n_voos: de 5 a 200")
+    desconhecidas = sorted(set(incertezas or {}) - set(INCERTEZAS_PADRAO))
+    if desconhecidas:
+        raise ToolError(f"incertezas: chave(s) desconhecida(s) {desconhecidas}. Aceitas: {list(INCERTEZAS_PADRAO)}")
+    sig = INCERTEZAS_PADRAO | (incertezas or {})
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in sig.values()):
+        raise ToolError("incertezas: valores numéricos >= 0 (desvio-padrão)")
+    opcoes = _opcoes_voo(opcoes_voo)
+    opcoes.pop("semente")
+    rng = np.random.default_rng(semente)
+    sorteios = [{"dv": rng.normal(0, sig["vento_ms"]), "ddir": rng.normal(0, sig["vento_direcao_graus"]),
+                 "dang": rng.normal(0, sig["angulo_trilho_graus"]), "fm": 1 + rng.normal(0, sig["massa_pct"] / 100),
+                 "fa": 1 + rng.normal(0, sig["arrasto_pct"] / 100), "fi": 1 + rng.normal(0, sig["impulso_pct"] / 100)}
+                for _ in range(n_voos)]
+    return sig, opcoes, sorteios
+
+
+def _rodar_dispersao(arquivo_ork, indice_simulacao, motor_eng, atraso_ejecao_s, montagem, opcoes, sorteios,
+                     semente, g_aletas, progresso=None):
+    """Simula os voos sorteados (síncrono). progresso(i) é chamado após cada voo."""
+    t0 = time.time()
+    doc, avisos = _carregar(arquivo_ork)
+    sim = _simulacao(doc, indice_simulacao)
+    orb.configurar(sim, **{k: v for k, v in opcoes.items() if k not in FATORES_VOO})
+    with orb.LOCK:
+        nominal = orb.condicoes_lancamento(sim)
+    voos = []
+    for i, s in enumerate(sorteios):
+        doc, _ = _carregar(arquivo_ork)
+        sim = _simulacao(doc, indice_simulacao)
+        op = dict(opcoes) | {"semente": semente * 100_000 + i,
+                             "angulo_trilho_graus": abs(nominal["angulo_trilho_graus"] + s["dang"])}
+        if nominal["modelo_vento"] == "AVERAGE":
+            op |= {"vento_medio_ms": max(0.0, nominal["vento_medio_ms"] + s["dv"]),
+                   "vento_direcao_graus": (nominal["vento_direcao_graus"] + s["ddir"]) % 360}
+        else:
+            op |= {"perfil_vento": [[n["altitude_m"], max(0.0, n["velocidade_ms"] + s["dv"]),
+                                     (n["direcao_graus"] + s["ddir"]) % 360, n["turbulencia_pct"]]
+                                    for n in nominal["perfil_vento"]],
+                   "perfil_vento_referencia": nominal["perfil_vento_referencia"]}
+        r = _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, op, [], g_aletas,
+                  {"massa": s["fm"], "impulso": s["fi"], "arrasto": s["fa"]})
+        seg, est, ev, pouso = r["seguranca"], r["estabilidade"], r["estabilidade_voo"], r["pouso"] or {}
+        voos.append({
+            "voo": i, "vento_ms": round(op.get("vento_medio_ms", nominal.get("vento_medio_ms") or 0) or 0, 2),
+            "delta_vento_ms": round(s["dv"], 2), "vento_direcao_graus": round((op.get("vento_direcao_graus") or 0), 1),
+            "angulo_trilho_graus": round(op["angulo_trilho_graus"], 2), "fator_massa": round(s["fm"], 4),
+            "fator_arrasto": round(s["fa"], 4), "fator_impulso": round(s["fi"], 4),
+            "apogeu_m": r["apogeu_m"], "velocidade_max_ms": r["velocidade_max_ms"], "mach_max": r["mach_max"],
+            "velocidade_saida_trilho_ms": r["velocidade_saida_trilho_ms"],
+            "margem_estatica_cal": est["margem_estatica_cal"], "estabilidade_saida_trilho_cal": ev["saida_trilho_cal"],
+            "estabilidade_min_subida_cal": ev["min_subida_cal"], "pouso_leste_m": pouso.get("leste_m"),
+            "pouso_norte_m": pouso.get("norte_m"), "distancia_pouso_m": pouso.get("distancia_m"),
+            "velocidade_abertura_recuperacao_ms": r["velocidade_abertura_recuperacao_ms"],
+            "velocidade_descida_final_ms": (seg["descida"] or [{}])[-1].get("velocidade_ms"),
+            "velocidade_impacto_ms": r["velocidade_impacto_ms"], "q_max_kpa": seg["q_max_kpa"],
+            "alertas": r["alertas_projeto"],
+        })
+        if progresso:
+            progresso(i + 1)
+    return voos, nominal, avisos, time.time() - t0
+
+
+def _resumir_dispersao(voos, nominal, avisos, duracao, semente, sig) -> dict:
+    def frac(cond):
+        return round(sum(1 for v in voos if cond(v)) / len(voos), 3)
+
+    metricas = ("apogeu_m", "velocidade_max_ms", "mach_max", "velocidade_saida_trilho_ms", "margem_estatica_cal",
+                "estabilidade_saida_trilho_cal", "estabilidade_min_subida_cal", "distancia_pouso_m",
+                "velocidade_abertura_recuperacao_ms", "velocidade_descida_final_ms", "velocidade_impacto_ms",
+                "q_max_kpa")
+    menor = lambda v: v["estabilidade_min_subida_cal"] if v["estabilidade_min_subida_cal"] is not None else 99  # noqa: E731
+    return {
+        "n_voos": len(voos), "semente": semente, "incertezas_1sigma": sig, "nominal": nominal,
+        "avisos_carregamento": avisos, "tempo_s": round(duracao, 1),
+        "estatisticas": {m: an.resumo_distribuicao([v[m] for v in voos]) for m in metricas},
+        "pouso_95": an.elipse_95([v["pouso_leste_m"] for v in voos if v["pouso_leste_m"] is not None],
+                                 [v["pouso_norte_m"] for v in voos if v["pouso_norte_m"] is not None]),
+        "probabilidades": {
+            "estabilidade_saida_trilho_abaixo_1cal": frac(lambda v: (v["estabilidade_saida_trilho_cal"] or 99) < 1),
+            "estabilidade_min_subida_abaixo_1cal": frac(lambda v: menor(v) < 1),
+            "saida_trilho_abaixo_15ms": frac(lambda v: v["velocidade_saida_trilho_ms"] < 15),
+            "mach_acima_0_8": frac(lambda v: v["mach_max"] > 0.8),
+            "descida_final_acima_9ms": frac(lambda v: (v["velocidade_descida_final_ms"] or 0) > 9),
+        },
+        "alertas": an.agrupar_alertas([v["alertas"] for v in voos]),
+        "piores_voos": {
+            "menor_estabilidade": [{k: v for k, v in x.items() if k != "alertas"} for x in sorted(voos, key=menor)[:3]],
+            "maior_deriva": [{k: v for k, v in x.items() if k != "alertas"}
+                             for x in sorted(voos, key=lambda v: -(v["distancia_pouso_m"] or 0))[:3]],
+        },
+    }
 
 
 def _gravar_csv(destino: Path, colunas: list[str], linhas) -> None:
@@ -418,6 +741,274 @@ def exportar_series_motor(arquivo_ric: str, arquivo_csv: str, sobrescrever: bool
     _gravar_csv(destino, colunas, linhas)
     return {"arquivo_csv": _rel(destino), "linhas": len(linhas), "colunas": colunas,
             "resumo": {k: res[k] for k in ("designacao", "impulso_total_Ns", "tempo_queima_s", "pressao_max_MPa")}}
+
+
+# ------------------------------------------------------------------------------------ calibração
+
+def _curva(arquivo: str, colunas: dict) -> dict:
+    """Curva de empuxo de um .eng, de um CSV de ensaio estático ou de um .ric (simulado)."""
+    p = _caminho(arquivo)
+    if not p.exists():
+        raise ToolError(f"Arquivo não encontrado: {arquivo}")
+    suf = p.suffix.lower()
+    if suf == ".eng":
+        return an.ler_eng(p)
+    if suf == ".csv":
+        return an.ler_csv_curva(p, **colunas)
+    if suf == ".ric":
+        with orb.LOCK:
+            motor = om.carregar_ric(p)
+            r = om.simular(motor)
+        if not om.resumo(motor, r)["sucesso"]:
+            raise ToolError(f"A simulação de {arquivo} falhou: {om.resumo(motor, r)['alertas']}")
+        return om.curva_motor(r)
+    raise ToolError(f"{arquivo}: use .eng, .csv (ensaio estático) ou .ric")
+
+
+@mcp.tool()
+def comparar_curvas_empuxo(referencia: str, comparada: str, coluna_tempo: str | None = None,
+                           coluna_empuxo: str | None = None, coluna_pressao: str | None = None) -> dict:
+    """Compara duas curvas de empuxo: .eng, .ric (simulado pelo openMotor) ou CSV de ensaio estático
+    (colunas detectadas pelo nome: time/tempo, force/thrust/empuxo, pressure/pressao; unidades pelo
+    cabeçalho, ex.: 'force (lbf)'). Devolve impulso, pico, instante do pico, queima (entre a 1ª e a
+    última vez acima de 5% do pico), empuxo médio, Isp (se houver massa de propelente), as diferenças em %
+    e o erro RMS ponto a ponto. Ex.: referencia='ensaios/estatico_1.csv', comparada='motores/m.ric'."""
+    colunas = {"coluna_tempo": coluna_tempo, "coluna_empuxo": coluna_empuxo, "coluna_pressao": coluna_pressao}
+    ref, cmp = _curva(referencia, colunas), _curva(comparada, colunas)
+    return {"referencia": referencia, "comparada": comparada} | an.comparar_curvas(ref, cmp)
+
+
+def _faixas(parametros, maximo: int) -> tuple[list[str], np.ndarray, np.ndarray]:
+    if not isinstance(parametros, dict) or not 1 <= len(parametros) <= maximo:
+        raise ToolError(f"parametros: de 1 a {maximo} itens {{nome: [mínimo, máximo]}}")
+    nomes, lo, hi = [], [], []
+    for nome, faixa in parametros.items():
+        if (not isinstance(faixa, (list, tuple)) or len(faixa) != 2
+                or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in faixa) or not faixa[0] < faixa[1]):
+            raise ToolError(f"parametros['{nome}']: use [mínimo, máximo] com mínimo < máximo")
+        nomes.append(nome)
+        lo.append(float(faixa[0]))
+        hi.append(float(faixa[1]))
+    return nomes, np.array(lo), np.array(hi)
+
+
+def _no_limite(nomes, valores, lo, hi) -> list[str]:
+    return [f"'{n}' terminou no limite da faixa ({v:g}): o ótimo pode estar fora; amplie a faixa"
+            for n, v, a, b in zip(nomes, valores, lo, hi) if min(v - a, b - v) <= 1e-3 * (b - a)]
+
+
+@mcp.tool()
+def calibrar_motor(arquivo_ric: str, referencia: str, parametros: dict[str, list[float]],
+                   coluna_tempo: str | None = None, coluna_empuxo: str | None = None,
+                   max_avaliacoes: int = 150, salvar_como: str | None = None, sobrescrever: bool = False) -> dict:
+    """Ajusta até 4 parâmetros do motor (.ric) para a curva simulada reproduzir uma curva medida (ensaio
+    estático em CSV ou .eng, ex.: curva reconstruída do voo), minimizando o erro RMS de empuxo.
+    parametros: {caminho de editar_motor: [mínimo, máximo]}. Os mais úteis:
+      'nozzle.efficiency' (nível de empuxo), 'propellant.a_factor' (velocidade de queima: multiplica o 'a'
+      de r = a·Pⁿ), 'nozzle.throat_mm', 'nozzle.erosionCoeff_m_sPa' (erosão da garganta),
+      'propellant.tabs[0].n', 'propellant.density_kg_m3'.
+    Devolve os valores ajustados e a comparação antes/depois. Limite do modelo: o openMotor não simula queima
+    erosiva, então um pico inicial causado por ela não será reproduzido (o erro restante mostra isso).
+    salvar_como grava o motor calibrado em .ric NOVO. ~0,05-0,5 s por avaliação."""
+    from scipy.optimize import minimize
+
+    nomes, lo, hi = _faixas(parametros, 4)
+    if not 10 <= max_avaliacoes <= 500:
+        raise ToolError("max_avaliacoes: de 10 a 500")
+    destino = _destino_novo(salvar_como, ".ric", sobrescrever) if salvar_como else None
+    ref = _curva(referencia, {"coluna_tempo": coluna_tempo, "coluna_empuxo": coluna_empuxo, "coluna_pressao": None})
+    with orb.LOCK:
+        original = om.carregar_ric(_ric_existente(arquivo_ric))
+        base = original.getDict()
+        iniciais = np.array([om.ler_caminho(original, n) for n in nomes])
+        om.editar(om.motor_de_dict(base), dict(zip(nomes, ((lo + hi) / 2).tolist())))  # valida os caminhos
+    contagem = [0]
+
+    def motor_com(xn):
+        motor = om.motor_de_dict(base)
+        om.editar(motor, dict(zip(nomes, (lo + np.clip(xn, 0, 1) * (hi - lo)).tolist())))
+        return motor
+
+    def objetivo(xn):
+        contagem[0] += 1
+        try:
+            with orb.LOCK:
+                motor = motor_com(xn)
+                om.validar(motor)
+                r = om.simular(motor)
+        except ToolError:
+            return 1e12
+        if not om.resumo(motor, r)["sucesso"]:
+            return 1e12
+        return an.erro_rms(ref, om.curva_motor(r))
+
+    x0 = np.clip((iniciais - lo) / (hi - lo), 0, 1)
+    res = minimize(objetivo, x0, method="Powell", bounds=[(0, 1)] * len(nomes),
+                   options={"maxfev": max_avaliacoes, "xtol": 1e-3, "ftol": 1e-4})
+    finais = lo + np.clip(res.x, 0, 1) * (hi - lo)
+    with orb.LOCK:
+        antes = om.curva_motor(om.simular(om.motor_de_dict(base)))
+        calibrado = motor_com(res.x)
+        r_final = om.simular(calibrado)
+        depois = om.curva_motor(r_final)
+        if destino:
+            om.salvar_ric(calibrado, destino)
+    out = {"parametros_ajustados": {n: _sig(v) for n, v in zip(nomes, finais)},
+           "parametros_iniciais": {n: _sig(v) for n, v in zip(nomes, iniciais)},
+           "antes": an.comparar_curvas(ref, antes), "depois": an.comparar_curvas(ref, depois),
+           "avaliacoes": contagem[0], "avisos": _no_limite(nomes, finais, lo, hi),
+           "simulacao_calibrada": om.resumo(calibrado, r_final)}
+    if destino:
+        out["arquivo_salvo"] = _rel(destino)
+    return out
+
+
+def _sig(x: float) -> float:
+    return float(f"{x:.6g}")
+
+
+@mcp.tool()
+@_erros_java
+def calibrar_voo(arquivo_ork: str, arquivo_log: str, coluna_tempo: str | None = None,
+                 coluna_altitude: str | None = None, unidade_altitude: str | None = None,
+                 ajustar: list[str] | None = None, faixa: list[float] | None = None, indice_simulacao: int = 0,
+                 motor_eng: str | None = None, atraso_ejecao_s: float | None = None, montagem: str | None = None,
+                 opcoes_voo: dict[str, Any] | None = None, max_avaliacoes: int = 40) -> dict:
+    """Ajusta fatores do modelo para o voo simulado reproduzir a altitude medida por um altímetro (CSV com
+    tempo e altitude; colunas detectadas pelo nome ou informadas; altitude em m ou ft, pelo cabeçalho ou por
+    unidade_altitude). Compara a SUBIDA: do instante em que cada série passa de 10 m até o apogeu do log
+    (o relógio do altímetro não precisa começar na ignição; a altitude é relativa ao 1º ponto do log).
+    ajustar: fatores entre 'arrasto' (padrão), 'impulso' e 'massa'; faixa: [mín, máx] dos fatores (padrão
+    [0,5; 2,0]). Use as mesmas condições do voo real (motor_eng com a curva do motor usado, vento, trilho...).
+    Devolve os fatores (ex.: fator_arrasto 1,18 = arrasto real 18% acima do modelo), o erro antes/depois e
+    os apogeus. Para usar o resultado: fator_arrasto=... em simular_voo, ou em opcoes_voo nas outras tools."""
+    from scipy.optimize import minimize
+
+    ajustar = ajustar or ["arrasto"]
+    if not set(ajustar) <= {"arrasto", "impulso", "massa"} or len(set(ajustar)) != len(ajustar):
+        raise ToolError("ajustar: lista sem repetição com 'arrasto', 'impulso' e/ou 'massa'")
+    lo_f, hi_f = faixa or [0.5, 2.0]
+    if not 0.1 <= lo_f < hi_f <= 10:
+        raise ToolError("faixa: [mín, máx] com 0,1 <= mín < máx <= 10")
+    if not 5 <= max_avaliacoes <= 150:
+        raise ToolError("max_avaliacoes: de 5 a 150")
+    log_path = _caminho(arquivo_log)
+    if not log_path.exists() or log_path.suffix.lower() != ".csv":
+        raise ToolError(f"arquivo_log precisa ser um .csv existente no workspace: {arquivo_log}")
+    log = an.ler_log_altitude(log_path, coluna_tempo, coluna_altitude, unidade_altitude)
+    opcoes = _opcoes_voo(opcoes_voo)
+    contagem = [0]
+
+    def voo(fatores: dict):
+        contagem[0] += 1
+        doc, _ = _carregar(arquivo_ork)
+        sim = _simulacao(doc, indice_simulacao)
+        res = _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes, [], None, fatores)
+        colunas, linhas, _ = orb.series_voo(sim)
+        it, ia = colunas.index("time_s"), colunas.index("altitude_m")
+        return res, an.erro_altitude(log, [l[it] for l in linhas], [l[ia] for l in linhas])
+
+    def objetivo(x):
+        return voo(dict(zip(ajustar, np.atleast_1d(x).tolist())))[1]["erro_rms_m"]
+
+    _, inicial = voo({})
+    if len(ajustar) == 1:
+        r = an.buscar_extremo(objetivo, lo_f, hi_f, maximizar=False, max_avaliacoes=max_avaliacoes)
+        valores = [r["valor"]]
+    else:
+        r = minimize(objetivo, np.ones(len(ajustar)), method="Powell", bounds=[(lo_f, hi_f)] * len(ajustar),
+                     options={"maxfev": max_avaliacoes, "xtol": 1e-3, "ftol": 1e-4})
+        valores = np.clip(r.x, lo_f, hi_f).tolist()
+    res_final, final = voo(dict(zip(ajustar, valores)))
+    ajustados = {f"fator_{k}": round(v, 4) for k, v in zip(ajustar, valores)}
+    return {
+        "fatores_ajustados": ajustados,
+        "erro_rms_altitude_m": {"antes": round(inicial["erro_rms_m"], 2), "depois": round(final["erro_rms_m"], 2)},
+        "apogeu_m": {"log": round(final["apogeu_log_m"], 1), "simulado_antes": round(inicial["apogeu_sim_m"], 1),
+                     "simulado_depois": round(final["apogeu_sim_m"], 1)},
+        "pontos_comparados": final["pontos"], "avaliacoes": contagem[0],
+        "avisos": _no_limite(list(ajustados), valores, [lo_f] * len(valores), [hi_f] * len(valores)),
+        "como_usar": f"simular_voo(..., {', '.join(f'{k}={v}' for k, v in ajustados.items())}) "
+                     f"ou opcoes_voo={ajustados}",
+    }
+
+
+# -------------------------------------------------------------------------------------- relatório
+
+@mcp.tool()
+async def gerar_relatorio(arquivo_ork: str, arquivo_html: str, ctx: Context, indice_simulacao: int = 0,
+                          motor_eng: str | None = None, arquivo_ric: str | None = None,
+                          atraso_ejecao_s: float | None = None, montagem: str | None = None,
+                          opcoes_voo: dict[str, Any] | None = None, material_aletas: str | None = None,
+                          modulo_cisalhamento_aletas_gpa: float | None = None,
+                          dispersao: dict[str, Any] | None = None, titulo: str | None = None,
+                          sobrescrever: bool = False) -> dict:
+    """Gera um relatório de voo em HTML autocontido (abre no navegador, imprime em PDF, envia por e-mail):
+    resumo, alertas, gráficos (altitude e velocidade, estabilidade e Mach na subida, empuxo e arrasto,
+    vista de cima com o ponto de pouso), estabilidade e massa, segurança e estrutura (q máximo, acelerações,
+    descida, impacto, flutter), condições de lançamento e, opcionalmente:
+      arquivo_ric: seção do motor (curva de empuxo e pressão, resumo do openMotor);
+      dispersao: {"n_voos": 50, "incertezas": {...}, "semente": 0} acrescenta a análise de dispersão
+        (estatísticas, probabilidades, pousos e elipse de 95%), como em analisar_dispersao.
+    As condições do voo seguem simular_voo (motor_eng, atraso, opcoes_voo, material das aletas).
+    Grava em arquivo NOVO no workspace (sobrescrever=True só se pedido). Devolve o caminho e o resumo."""
+    destino = _destino_novo(arquivo_html, ".html", sobrescrever)
+    opcoes = _opcoes_voo(opcoes_voo)
+    g_aletas = _g_aletas(material_aletas, modulo_cisalhamento_aletas_gpa)
+    prep = None
+    if dispersao is not None:
+        if not isinstance(dispersao, dict) or set(dispersao) - {"n_voos", "incertezas", "semente"}:
+            raise ToolError("dispersao: objeto com n_voos, incertezas e/ou semente")
+        sem = dispersao.get("semente", 0)
+        prep = (_preparar_dispersao(dispersao.get("n_voos", 50), dispersao.get("incertezas"), opcoes_voo, sem), sem)
+    ric = _ric_existente(arquivo_ric) if arquivo_ric else None
+
+    def trabalho():
+        doc, avisos = _carregar(arquivo_ork)  # espera a JVM terminar de subir ANTES de importar o matplotlib:
+        # ARMADILHA (Windows): carregar as DLLs do matplotlib enquanto a JVM inicializa em outra thread travou o
+        # processo (loader lock): jvm-boot parada em OpenRocketCore.initialize, import parado em create_module.
+        from . import relatorio as rel  # import tardio: o servidor sobe sem pagar o custo do matplotlib
+
+        sim = _simulacao(doc, indice_simulacao)
+        voo = _voar(doc, sim, motor_eng, atraso_ejecao_s, montagem, opcoes, avisos, g_aletas)
+        colunas, linhas, eventos = orb.series_voo(sim)
+        motor_voo = ", ".join(m["motor_atual"] for m in orb.montagens(doc, sim)) or "—"
+        s = rel.series_dict(colunas, linhas)
+        graficos = {"trajetoria": rel.grafico_trajetoria(s, eventos), "subida": rel.grafico_subida(s, eventos),
+                    "empuxo": rel.grafico_empuxo_voo(s, eventos)}
+        motor = None
+        if ric:
+            with orb.LOCK:
+                m = om.carregar_ric(ric)
+                r = om.simular(m)
+            motor = {"arquivo": arquivo_ric, "resumo": om.resumo(m, r)}
+            if motor["resumo"]["sucesso"]:
+                motor["grafico"] = rel.grafico_motor(om.curva_motor(r))
+        disp = None
+        if prep:
+            (sig, op_d, sorteios), sem = prep
+            n = len(sorteios)
+            voos, nominal, av, dur = _rodar_dispersao(arquivo_ork, indice_simulacao, motor_eng, atraso_ejecao_s,
+                                                      montagem, op_d, sorteios, sem, g_aletas,
+                                                      lambda i: anyio.from_thread.run(ctx.report_progress, i, n))
+            disp = {"resumo": _resumir_dispersao(voos, nominal, av, dur, sem, sig)}
+            disp["grafico"] = rel.grafico_pouso(s, voos, disp["resumo"]["pouso_95"])
+        else:
+            graficos["pouso"] = rel.grafico_pouso(s)
+        contexto = {"foguete": str(doc.getRocket().getName()), "simulacao": str(sim.getName()),
+                    "motor": motor_voo, "arquivo_ork": arquivo_ork}
+        texto = rel.montar_html(titulo or f"Relatório de voo: {contexto['foguete']}", contexto, voo, graficos,
+                                motor, disp)
+        destino.write_text(texto, encoding="utf-8")
+        return voo, disp, len(texto)
+
+    voo, disp, tamanho = await anyio.to_thread.run_sync(_erros_java(trabalho))
+    out = {"arquivo_html": _rel(destino), "tamanho_kb": round(tamanho / 1024, 1),
+           "resumo": {k: voo[k] for k in ("apogeu_m", "velocidade_max_ms", "mach_max", "velocidade_saida_trilho_ms")},
+           "alertas_projeto": voo["alertas_projeto"]}
+    if disp:
+        out["dispersao"] = {"n_voos": disp["resumo"]["n_voos"], "probabilidades": disp["resumo"]["probabilidades"]}
+    return out
 
 
 @mcp.tool()

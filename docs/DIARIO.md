@@ -257,3 +257,81 @@ outras duas se mostraram necessárias. `listar_tipos_grao` é como o LLM descobr
     é grande. Com 6 m/s ou mais, aparecem alertas de estabilidade < 1 cal.
   - **Ângulo do trilho** com 6 m/s de vento: a deriva é mínima perto de 2° (49 m), contra 869 m com os
     10° do arquivo.
+
+---
+
+## 2026-10-18 (cont.) — Recomendações 2 a 7: vento, otimização, segurança, dispersão, calibração, relatório
+
+Feito na ordem do mais fácil para o mais difícil, com relatório ao João ao fim de cada item.
+**Estado:** `pytest`: **158 passed** (~90 s). `teste_cliente.py` igual à §8. **20 tools.**
+
+### Item 3: perfil de vento por altitude
+- `perfil_vento` (`[[altitude_m, velocidade_ms, direcao_graus(, turbulencia_pct)], ...]`) e
+  `perfil_vento_referencia` (`AGL`/`MSL`) no `simular_voo`, no `opcoes_voo` e como parâmetro de varredura.
+- **Armadilha (bug latente corrigido):** os **getters** de vento das `SimulationOptions` (`getWindDirection`,
+  `getWindSpeedAverage`, `getWindTurbulenceIntensity`, `getWindSpeedDeviation`) trocam o modelo para o
+  médio. O `condicoes_lancamento` chamava um deles antes de simular, então todo `.ork` com vento
+  multinível era convertido em silêncio. Agora a leitura vai direto no modelo (`getAverageWindModel()`),
+  com um teste de regressão.
+- Com "lançar contra o vento", o `getLaunchRodDirection()` já devolve a direção efetiva (no multinível,
+  a do vento na altitude de lançamento).
+
+### Item 7: `otimizar_parametro`
+- Meta numérica por bisseção (explica o alcance quando a meta está fora do intervalo); `min`/`max` por
+  malha seguida de seção áurea. Funciona para foguete, condição de lançamento e motor; métricas estáticas
+  não simulam. Algoritmos em `analise.py`, testados sem JVM.
+- Hemera: o ângulo do trilho com deriva mínima, com vento de 6 m/s, é 2,4° (pouso a 0,6 m). Notus: a
+  garganta para Pmax = 6 MPa é 25,56 mm.
+
+### Item 5: segurança e estrutura (bloco `seguranca`)
+- q máximo, aceleração na subida e **na recuperação**, empuxo/peso, velocidade de descida por fase, impacto
+  e flutter (com `material_aletas`, só metais na tabela, ou `modulo_cisalhamento_aletas_gpa`).
+- Hemera: **o choque de abertura do principal é de 23,2 g, contra 10,7 g na subida**; o
+  `getMaxAcceleration()` do OpenRocket só mostra a subida. Flutter com aletas de 5 mm: alumínio 2,4×;
+  compósito com G = 5 GPa 1,05×; com G = 2 GPa, 0,67×. **Falta saber o material.**
+- **Fórmula de flutter:** a versão do Peak of Flight #291 dá √2 a mais que a NACA TN-4197 (a constante
+  1,337 = 39,3/(2·14,696) já absorve o ½, e a expressão ainda divide por 2). Usamos a da NACA, mais
+  conservadora. Isso está registrado em `tests/test_seguranca.py`.
+
+### Item 2: `analisar_dispersao` (Monte Carlo)
+- Incertezas (1σ): vento, direção, ângulo do trilho, massa (estrutura × fator, CG mantido), arrasto
+  (fator no CDaxial) e impulso (curva escalada). Saída: estatísticas, elipse de pouso de 95%,
+  probabilidades, alertas agrupados e piores voos. A semente torna tudo reprodutível; há progresso e CSV.
+- **Fator de arrasto sem compilar Java:** um `SimulationComputationListener` implementado em Python via
+  JPype multiplica o `CDaxial`. Com fator 1,0 o resultado é idêntico; o custo é de ~0,1–0,2 s por voo.
+  `Simulation.simulate(listeners...)` aceita listeners extras diretamente. **Isso pode simplificar o plano do
+  `AIRBRAKE.md`, que previa um JAR em Java.**
+- Hemera (100 voos, condições do arquivo): apogeu p5 a p95 de 2.547 a 3.032 m; 7% dos voos com
+  estabilidade abaixo de 1 cal na saída do trilho; 37% acima de Mach 0,8; elipse de pouso de 1.125 × 470 m
+  centrada ~950 m a leste.
+
+### Item 4: calibração
+- `comparar_curvas_empuxo` (`.eng`, `.ric` ou CSV de ensaio, com detecção de colunas e unidades),
+  `calibrar_motor` (até 4 parâmetros, Powell) e `calibrar_voo` (fatores de arrasto, impulso e massa contra
+  o log do altímetro, alinhado no cruzamento de 10 m).
+- `fator_arrasto`, `fator_impulso` e `fator_massa` valem em todas as tools de voo. O `editar_motor` ganhou
+  `propellant.a_factor`, `propellant.tabs[i].<param>` e `propellant.density_kg_m3`.
+- Validação: curva sintética (eficiência recuperada com ±0,005), log sintético (arrasto ×1,30 recuperado,
+  inclusive em pés e ms com o relógio deslocado) e o **ensaio real O3800** do openMotor (erro RMS de
+  1.123 para 709 N).
+- **Notus:** o `Notus_Voo.eng` é a curva **reconstruída do voo** (Blue Raven, F = m·a + arrasto, Cd 0,36
+  assumido). Ela tem o mesmo impulso da teórica (−0,4%), mas pico de 6,7 kN em 0,22 s e queima de 4,4 s.
+  **A calibração não a reproduz:** o melhor ajuste exige eficiência de 0,73, Isp de 97 s e perde 17% de
+  impulso. Prováveis causas: artefato do Cd assumido na cauda e queima erosiva no início, que o openMotor
+  não modela. Próximo passo: usar o log bruto do altímetro com `calibrar_voo`.
+
+### Item 6: `gerar_relatorio`
+- HTML autocontido com gráficos SVG (matplotlib pela API `Figure`, sem pyplot): resumo, alertas, voo,
+  estabilidade, segurança, lançamento e, opcionalmente, motor e dispersão. Texto do usuário escapado.
+  O matplotlib entrou nas dependências.
+- Exemplo: `workspace_teste/relatorios/hemera_notus_rec_v2.html` (125 KB, com 50 voos de dispersão).
+- **Armadilha (Windows), travamento reproduzido:** importar o matplotlib (DLLs) enquanto a JVM inicializa
+  em outra thread travou o processo. A thread `jvm-boot` ficou parada em `OpenRocketCore.initialize`, e o
+  import, em `create_module`, com CPU a 100% por mais de 10 minutos. Correção: o import só acontece depois
+  de a JVM estar pronta. Há teste de regressão em `test_stdio.py`. **Regra:** nada de importar módulos com
+  extensões nativas novas antes do `garantir()`.
+
+### Pendências
+- O material das aletas do Hemera (para o flutter) e o log bruto do Blue Raven do voo do Notus.
+- O `.ric` gravado ainda não foi aberto na GUI do openMotor.
+- A suíte de testes passou de ~35 s para ~90 s (dispersão, calibração com dados reais e relatórios).
