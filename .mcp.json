@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rocket-mcp": {
+      "type": "stdio",
+      "command": "C:\\codiguins\\mcp-open-rocket-motor\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "rocket_mcp.server"],
+      "env": {
+        "ROCKET_MCP_WORKSPACE": "C:\\codiguins\\mcp-open-rocket-motor\\workspace_teste",
+        "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-25.0.4.101-hotspot"
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+[project]
+name = "rocket-mcp"
+version = "0.1.0"
+description = "Servidor MCP unificado para openMotor (balística interna) e OpenRocket (trajetória)"
+requires-python = ">=3.12,<3.14"  # scikit-fmm ainda não tem wheel para 3.14
+license = "GPL-3.0-only"  # openMotor e OpenRocket são GPL-3.0
+dependencies = [
+    "mcp>=2.3,<3",        # 2.x: FastMCP virou MCPServer (mcp.server.mcpserver)
+    "jpype1>=1.7",
+    "numpy",
+    "scipy",
+    "scikit-fmm",
+    "scikit-image",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]  # pip install -e .[dev]; o plugin pytest do anyio já vem com o mcp
+
+[project.scripts]
+rocket-mcp = "rocket_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rocket_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A JVM usa access violations de propósito (safepoints, null checks); o faulthandler do pytest as
+# reporta como "Windows fatal exception". Recomendação do JPype: desligar.
+addopts = "-p no:faulthandler"
+filterwarnings = ["ignore::RuntimeWarning:motorlib.nozzle"]  # fsolve do motorlib original, inofensivo
+markers = ["stdio: sobe o servidor como subprocesso (mais lento)"]
