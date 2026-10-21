@@ -1,6 +1,7 @@
 """Linha de base das tools existentes (roadmap item 2), pelo protocolo MCP com o servidor em memória.
 Referência: saída da §8 do documento de análise."""
 import json
+import sys
 
 import pytest
 from mcp import Client
@@ -109,7 +110,11 @@ async def test_salvar_como_ork_novo_preserva_motor(chamar, workspace):
     assert original["montagens"][0]["motor_atual"] == "A8-3"  # original intocado
 
 
-@pytest.mark.parametrize("caminho", ["../fora.ork", "..\\fora.ork", "sub/../../fora.ork"])
+@pytest.mark.parametrize("caminho", [
+    "../fora.ork", "sub/../../fora.ork",
+    # só no Windows '\\' separa diretórios; no Linux '..\\fora.ork' é um nome de arquivo dentro do workspace
+    pytest.param("..\\fora.ork", marks=pytest.mark.skipif(sys.platform != "win32", reason="separador do Windows")),
+])
 async def test_caminho_relativo_fora_do_workspace(chamar, caminho):
     erro, msg = await chamar("abrir_foguete", arquivo_ork=caminho)
     assert erro and "fora do workspace" in msg

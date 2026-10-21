@@ -1,0 +1,61 @@
+# Laminação das aletas para analisar_flutter / comparar_aletas (docs/FLUTTER.md §3.2).
+# Unidades SI. ATENÇÃO: escreva o expoente com sinal (55.0e+9). O PyYAML lê "55.0e9" como texto;
+# o servidor aceita os dois formatos, mas outras ferramentas podem não aceitar.
+
+materials:
+  carbono:              # propriedades da LÂMINA (sistema 1-2 da lâmina)
+    E1: 55.0e+9
+    E2: 55.0e+9
+    G12: 4.0e+9         # a propriedade mais importante para flutter e a menos confiável: medir
+    nu12: 0.08
+    rho: 1500
+    source: placeholder # trocar por "ensaio AAAA-MM" quando houver dados
+  vidro:
+    E1: 20.0e+9
+    E2: 20.0e+9
+    G12: 3.5e+9
+    nu12: 0.12
+    rho: 1850
+    source: placeholder
+
+laminates:              # de baixo para cima; theta medido a partir da ENVERGADURA (0° = fibra radial)
+  L6_quasi:             # o "L8_quasi" do documento (que tem 6 lâminas)
+    - {mat: carbono, theta_deg: 0,  t: 0.30e-3}
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+    - {mat: carbono, theta_deg: 0,  t: 0.30e-3}
+  L10_45faces:          # exemplo: ±45 nas faces (mais D66) e mais espessura
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+    - {mat: carbono, theta_deg: 0,  t: 0.30e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: vidro,   theta_deg: 0,  t: 0.20e-3}
+    - {mat: carbono, theta_deg: 0,  t: 0.30e-3}
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+    - {mat: carbono, theta_deg: 45, t: 0.30e-3}
+
+analysis:
+  e_ea: 0.40            # eixo elástico em fração da corda (sensibilidade: 0.35-0.50)
+  eta_ref: 0.75         # estação da seção típica (fração da envergadura)
+  g_s: 0.0              # amortecimento estrutural considerado (0 = conservador)
+
+# Opcional: laminado de cada conjunto de aletas do .ork (caminho de ler_foguete; basta o final se único)
+# e as frequências medidas por tap test, que substituem as calculadas.
+# aletas:
+#   "Sustainer/Sustainer Fin Section/Trapezoidal Fin Set": {laminado: L6_quasi}
+#   "Booster/Booster fin section/Trapezoidal Fin Set": {laminado: L10_45faces, f_h_hz: 85, f_a_hz: 240}
+
+# Opcional: critérios da §12 (estes são os padrões).
+# criterios:
+#   margem_flutter: 1.5
+#   margem_flutter_calibrada: 1.15
+#   margem_transonico: 1.7
+#   margem_divergencia: 1.32
+#   margem_tn4197: 1.0
+#   d16_d11: 0.1
+#   estabilidade_min_cal: 1.5
+#   estabilidade_max_cal: 3.0

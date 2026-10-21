@@ -504,6 +504,7 @@ def _analisar_ramo(ramo) -> dict:
     subida = [(ti, e) for ti, e in zip(t, est)
               if t_trilho is not None and t_apogeu is not None and t_trilho <= ti <= t_apogeu and e == e]
     t_min, e_min = min(subida, key=lambda p: p[1]) if subida else (None, None)
+    e_max = max(e for _, e in subida) if subida else None
     saida = _valor_em(t, est, t_trilho)
 
     def r(x, n):
@@ -517,7 +518,7 @@ def _analisar_ramo(ramo) -> dict:
         pouso = {"distancia_m": r(math.hypot(x, y), 1), "rumo_graus": round(math.degrees(math.atan2(x, y))) % 360,
                  "leste_m": r(x, 1), "norte_m": r(y, 1)}
     return {"estabilidade_voo": {"saida_trilho_cal": r(saida, 2), "min_subida_cal": r(e_min, 2),
-                                 "t_min_subida_s": r(t_min, 2)},
+                                 "t_min_subida_s": r(t_min, 2), "max_subida_cal": r(e_max, 2)},
             "pouso": pouso}
 
 
@@ -643,6 +644,32 @@ def seguranca(doc, sim, g_aletas_pa: float | None = None) -> dict:
     return out
 
 
+def trajetoria_estagio(sim, estagio) -> tuple[list[tuple], dict]:
+    """(t, V, M, rho, p, a) em SI que as aletas de um estágio voam, do voo já simulado, e de onde veio.
+    O ramo 0 é o do estágio de cima (sustentador): voo inteiro, inclusive a fase empilhada. Cada estágio
+    que se separa ganha um ramo com o próprio nome que, no OpenRocket 24.12, começa em t = 0 (os dados
+    de antes da separação são copiados). Sem esse ramo, usa o ramo 0 até a separação do estágio."""
+    nome = str(estagio.getName()).strip()
+    with LOCK:
+        d = sim.getSimulatedData()
+        ramos = [d.getBranch(i) for i in range(d.getBranchCount())]
+        ramo, ate, origem = ramos[0], None, "ramo 0"
+        if str(ramos[0].getName()).strip() != nome:
+            proprio = [r for r in ramos[1:] if str(r.getName()).strip() == nome]
+            if proprio:
+                ramo, origem = proprio[0], f"ramo '{nome}'"
+            else:
+                sep = [float(e.getTime()) for e in ramos[0].getEvents()
+                       if str(e.getType().name()) == "STAGE_SEPARATION" and e.getSource() is not None
+                       and str(e.getSource().getName()).strip() == nome]
+                ate = sep[0] if sep else None
+                origem = f"ramo 0 até a separação ({ate} s)" if sep else "ramo 0 (separação não encontrada)"
+        colunas = [_dados(ramo, k) for k in ("TYPE_TIME", "TYPE_VELOCITY_TOTAL", "TYPE_MACH_NUMBER",
+                                             "TYPE_AIR_DENSITY", "TYPE_AIR_PRESSURE", "TYPE_SPEED_OF_SOUND")]
+    traj = [linha for linha in zip(*colunas) if all(x == x for x in linha) and (ate is None or linha[0] <= ate)]
+    return traj, {"estagio": nome, "origem": origem, "pontos": len(traj)}
+
+
 # Séries exportadas por exportar_series_voo: (coluna, FlightDataType, fator)
 SERIES_VOO = (
     ("time_s", "TYPE_TIME", 1), ("altitude_m", "TYPE_ALTITUDE", 1), ("velocity_z_ms", "TYPE_VELOCITY_Z", 1),
@@ -652,6 +679,9 @@ SERIES_VOO = (
     ("cg_mm", "TYPE_CG_LOCATION", 1000), ("cp_mm", "TYPE_CP_LOCATION", 1000), ("aoa_deg", "TYPE_AOA", 180 / math.pi),
     ("position_east_m", "TYPE_POSITION_X", 1), ("position_north_m", "TYPE_POSITION_Y", 1),
     ("wind_ms", "TYPE_WIND_VELOCITY", 1),
+    # atmosfera local (flutter, cargas): pressão, densidade, temperatura e velocidade do som
+    ("air_pressure_Pa", "TYPE_AIR_PRESSURE", 1), ("air_density_kg_m3", "TYPE_AIR_DENSITY", 1),
+    ("air_temperature_K", "TYPE_AIR_TEMPERATURE", 1), ("speed_of_sound_ms", "TYPE_SPEED_OF_SOUND", 1),
 )
 
 

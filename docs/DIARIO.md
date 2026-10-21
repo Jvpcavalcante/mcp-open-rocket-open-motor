@@ -335,3 +335,112 @@ Feito na ordem do mais fácil para o mais difícil, com relatório ao João ao f
 - O material das aletas do Hemera (para o flutter) e o log bruto do Blue Raven do voo do Notus.
 - O `.ric` gravado ainda não foi aberto na GUI do openMotor.
 - A suíte de testes passou de ~35 s para ~90 s (dispersão, calibração com dados reais e relatórios).
+
+---
+
+## 2026-10-21 — Estudo de aletas: modelo aerodinâmico (antes do flutter)
+
+Pedido do João: avaliar como diferentes aletas mudam o modelo aerodinâmico do OpenRocket e, depois,
+escrever o cálculo de flutter em Python. Esta etapa cobre só a primeira parte.
+**Estado:** `pytest`: **179 passed, 1 skipped** (~75 s), agora no **Linux (Arch) com Java 26**.
+`teste_cliente.py` igual à §8. **22 tools.**
+
+### Parâmetros de aleta (editar_foguete, varrer_parametro, otimizar_parametro)
+- Nomes do pedido → parâmetros: tip chord `tipChord_mm`, root chord `rootChord_mm`, height `span_mm`
+  (o "height" da GUI), sweep angle `sweepAngle_deg` (**novo**), número `count`, espessura `thickness_mm`.
+  "Length" foi lido como `sweepLength_mm`; a posição no corpo é `position_mm`.
+- Novos, além do ângulo: `material` (nome do banco do OpenRocket, sem diferenciar maiúsculas),
+  `materialDensity_kg_m3`, `finish` (rugosidade), `filletRadius_mm`, `tabHeight_mm`, `tabLength_mm`.
+  `material`/`finish` valem para qualquer componente externo; `material`, também para os estruturais.
+- **Armadilha:** mudar `span_mm` mantém o `sweepLength_mm` (o ângulo muda). Na mesma edição, o
+  `sweepAngle_deg` é aplicado por último; informar `sweepLength_mm` e `sweepAngle_deg` juntos é erro.
+  O `material` é aplicado antes da densidade.
+- `ler_foguete` traz a `geometria` de cada conjunto de aletas (área, alongamento s²/S de uma aleta,
+  afilamento, enflechamentos do bordo de ataque, meia corda e bordo de fuga, CMA e sua posição, t/c).
+  As fórmulas ficam em `aletas.py`, sem JVM; o cálculo de flutter deve entrar nesse módulo.
+
+### Tools novas
+- **`analisar_aerodinamica`:** o Barrowman do OpenRocket sem simular o voo. Para cada Mach, dá CNα, CP,
+  margem (CG na decolagem e no burnout) e CD separado em atrito, pressão e base, para o foguete e para
+  cada conjunto de aletas, com a fração do total. Também dá a contribuição de todos os componentes
+  num Mach. Aceita AoA, altitude (ISA) e `alteracoes` só em memória.
+  Usa `BarrowmanCalculator.getForceAnalysis`: o CNα é o `weight` do `getCP()`.
+- **`comparar_aletas`:** o original e até 30 variantes, lado a lado (geometria, massa, aerodinâmica
+  por Mach e, opcionalmente, voo e flutter), com CSV opcional. Todas as variantes são validadas antes da
+  primeira simulação.
+- **Massa sobrescrita (o caso do Hemera):** as aletas estão dentro do "Lower Propulsion Module", cuja
+  massa é sobrescrita incluindo os filhos, então mudar a geometria não mudaria a massa. Com
+  `compensar_massa` (padrão), o `comparar_aletas` soma ao override a variação da massa calculada das aletas.
+- `exportar_series_voo` ganhou colunas atmosféricas (`air_pressure_Pa`, `air_density_kg_m3`,
+  `air_temperature_K`, `speed_of_sound_ms`), que o cálculo de flutter vai usar.
+
+### O que o modelo do OpenRocket mostra (para orientar o estudo)
+- **Hemera** (4 aletas, cr 270, ct 130, s 180 mm, enflechamento de 45°, 5 mm, aerofólio, fibra de
+  carbono): as aletas dão **~90% do CNα** (9,39 de 10,47 a Mach 0,3), mas só 3,5% do CD a Mach 0,3 e 7%
+  a Mach 0,9 (o arrasto de pressão das aletas cresce no transônico). O CNα das aletas sobe até ~Mach 1,1
+  e cai no supersônico (7,18 a Mach 1,5).
+- **No Barrowman, a espessura não muda o CNα**, só o CD e a massa. O CNα depende da planta (área,
+  envergadura, enflechamento da meia corda) e do número de aletas. Por isso, no flutter, a espessura e a
+  rigidez são justamente o que o OpenRocket não "vê".
+- A queda do CNα no supersônico depende da geometria: nas aletas de baixo alongamento do foguete de
+  exemplo, ele ainda sobe a Mach 1,5.
+
+### Ambiente Linux
+- Montagem: `python3.12 -m venv .venv`, `pip install -e .[dev]` e `scripts/preparar_vendor.py`. O Java
+  26 do sistema funcionou sem ajuste (`JAVA_HOME=/usr/lib/jvm/default`). A escrita em campo `final` da
+  semente do vento (JEP 500) ainda passa.
+- O `.mcp.json` versionado aponta para caminhos do Windows: o servidor não conecta no Linux sem um ajuste
+  local.
+- **O motor do Hemera (Notus) não está nesta máquina** (`workspace_teste/motores/` está no `.gitignore`).
+  Sem ele, o Hemera não voa aqui e a margem estática sai sem o motor. Falta copiar os `.eng` / `.ric` do
+  Windows.
+- O caso `..\fora.ork` do teste de sandbox passou a valer só no Windows: no Linux, `\` é um caractere de
+  nome de arquivo, e o caminho fica dentro do workspace.
+
+### Próximo passo
+Flutter em Python (`aletas.py`): rever a NACA TN-4197 (hoje usa t/c da raiz e só aletas trapezoidais),
+considerar compósitos (G efetivo do laminado) e cruzar com as séries de voo (Mach, pressão e velocidade
+do som ao longo da subida).
+
+---
+
+## 2026-10-21 (cont.) — Flutter de aletas compósitas (docs/FLUTTER.md)
+
+O João escreveu `docs/FLUTTER.md` (CLPT + Ritz de placa + seção típica + V-g, a partir da planilha Mathcad)
+e pediu para verificar e implementar. **Estado:** `pytest`: **220 passed, 1 skipped** (~80 s). **23 tools.**
+
+### Verificação do documento
+As derivações e os números conferem: Theodorsen, piston theory, CLPT, a matriz V-g, a TN-4197 em SI (igual
+à do bloco `seguranca`) e as três validações da §14. Os problemas estão no **Apêndice C** do documento.
+Os principais:
+- o PyYAML lê `55.0e9` como texto;
+- a subamostragem do `run_case` pulava o ponto de q máximo;
+- o V-g "não casado" é não conservador no subsônico;
+- o critério transônico deve valer para todo ponto transônico;
+- seção AIRFOIL e massa sobrescrita mudam a massa da aleta no OpenRocket.
+
+### O que entrou
+- **`fin_flutter.py`**: a §15 com as correções. O V-g é vetorizado (mesmos números do original, com
+  diferença de 1e-15; 3,6 s → 0,12 s por caso). Aceita frequências medidas (tap test) e verifica o ponto
+  casado no ponto crítico. Os testes de regressão usam números calculados com o código original.
+- **`flutter_estudo.py`**: validação do YAML (com mensagens para módulo em GPa e espessura em mm),
+  critérios da §12, sensibilidade da §13 e limpeza de `inf` para JSON.
+- **`analisar_flutter`**: aplica o laminado à aleta (espessura h, material "Laminado X" com ρ_eq e
+  compensação da massa sobrescrita), simula e roda o flutter na trajetória do estágio de cada conjunto.
+  Entrega os critérios (`aprovado_flutter` separado da estabilidade), a sensibilidade, o CSV da margem
+  no tempo e o `.ork` com o laminado.
+- **`comparar_aletas`** ganhou `arquivo_config`, `laminado` e a chave `laminado` por variante. Cada linha
+  traz `flutter_laminado`. Este é o laço da §13.
+- `estabilidade_voo` ganhou `max_subida_cal`. O `conftest` agora também extrai o exemplo
+  "Two stage high power rocket" do JAR.
+- Modelo de configuração em `workspace_teste/fins_config.yaml`, com placeholders.
+
+### Armadilha nova do OpenRocket 24.12
+- Em foguete de dois estágios, o ramo do booster tem o nome do estágio e **começa em t = 0** (os dados de
+  antes da separação são copiados). O ramo 0 é o do sustentador, com o voo inteiro.
+
+### Pendências
+- O `.ork` do foguete de dois estágios da equipe e as propriedades **medidas** das lâminas (G12
+  principalmente). Hoje tudo é placeholder.
+- Tap test das aletas para calibrar f_h e f_a (critério de 1,15 em vez de 1,5).
+- Gráficos 1 e 2 da §13 (os dados já saem nos CSV).

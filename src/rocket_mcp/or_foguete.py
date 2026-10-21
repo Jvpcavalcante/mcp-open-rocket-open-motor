@@ -21,6 +21,8 @@ from typing import Any, Callable
 import jpype
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import aletas
+
 _PACOTE = "info.openrocket.core."
 _FATORES = {"mm": 1e-3, "deg": math.pi / 180, "kg": 1.0, "m": 1.0, "s": 1.0, "": 1.0}
 
@@ -125,6 +127,33 @@ def _override_cg():
     return _Param("overrideCG_mm", _nao("ComponentAssembly"), ler, escrever, anulavel=True, minimo=None)
 
 
+def _materiais() -> dict[str, Any]:
+    """Materiais volumétricos (BULK) do banco do OpenRocket, por nome."""
+    from info.openrocket.core.database import Databases
+
+    return {str(m.getName()): m for m in Databases.BULK_MATERIAL}
+
+
+def _material():
+    """Material do banco do OpenRocket pelo nome ('Carbon fiber', 'Aluminum', 'Fiberglass'...).
+    Só muda a massa: o OpenRocket não usa rigidez em lugar nenhum (o flutter usa o módulo de cisalhamento
+    informado à parte)."""
+    return _Param("material", _e("ExternalComponent", "StructuralComponent"),
+                  lambda c, sim: str(c.getMaterial().getName()),
+                  lambda c, sim, v: c.setMaterial(_materiais()[v]),
+                  tipo="material", opcoes=lambda: sorted(_materiais()), afeta_massa=True)
+
+
+def _densidade_material():
+    """Densidade do material atual: cria um material próprio com o mesmo nome (gravado no .ork)."""
+    def escrever(c, sim, v):
+        m = c.getMaterial()
+        c.setMaterial(_cls("material.Material").newMaterial(m.getType(), m.getName(), float(v), True))
+
+    return _Param("materialDensity_kg_m3", _e("ExternalComponent", "StructuralComponent"),
+                  lambda c, sim: float(c.getMaterial().getDensity()), escrever, afeta_massa=True)
+
+
 def _parametros() -> list[_Param]:
     comprimento = _e("SymmetricComponent", "MassObject", "RingComponent", "LaunchLug")
     transicao = lambda c: isinstance(c, _rc("Transition")) and not isinstance(c, _rc("NoseCone"))  # noqa: E731
@@ -145,6 +174,9 @@ def _parametros() -> list[_Param]:
              afeta_massa=True),
         _num("thickness_mm", _e("BodyTube", "Transition", "FinSet"), "getThickness", "setThickness",
              afeta_massa=True),
+        _material(),
+        _densidade_material(),
+        _enum("finish", _e("ExternalComponent"), "getFinish", "setFinish", "rocketcomponent.ExternalComponent$Finish"),
         _num("baseDiameter_mm", _e("NoseCone"), "getBaseRadius", "setBaseRadius", 2, "setBaseRadiusAutomatic",
              afeta_massa=True),
         _num("foreDiameter_mm", transicao, "getForeRadius", "setForeRadius", 2, "setForeRadiusAutomatic",
@@ -161,7 +193,12 @@ def _parametros() -> list[_Param]:
         _num("tipChord_mm", _e("TrapezoidFinSet"), "getTipChord", "setTipChord", afeta_massa=True),
         _num("span_mm", _e("TrapezoidFinSet", "EllipticalFinSet"), "getHeight", "setHeight", afeta_massa=True),
         _num("sweepLength_mm", _e("TrapezoidFinSet"), "getSweep", "setSweep", minimo=None),
+        # mudar span_mm mantém sweepLength_mm (o ângulo muda): sweepAngle_deg é aplicado por último
+        _num("sweepAngle_deg", _e("TrapezoidFinSet"), "getSweepAngle", "setSweepAngle", minimo=None),
         _num("rootChord_mm", _e("EllipticalFinSet"), "getLength", "setLength", afeta_massa=True),
+        _num("filletRadius_mm", _e("FinSet"), "getFilletRadius", "setFilletRadius", afeta_massa=True),
+        _num("tabHeight_mm", _e("FinSet"), "getTabHeight", "setTabHeight", afeta_massa=True),
+        _num("tabLength_mm", _e("FinSet"), "getTabLength", "setTabLength", afeta_massa=True),
         # massas
         _num("mass_kg", _e("MassComponent"), "getComponentMass", "setComponentMass", afeta_massa=True),
         # recuperação
@@ -191,6 +228,10 @@ def _todos() -> list[_Param]:
 
 def _params_de(c) -> dict[str, _Param]:
     return {p.nome: p for p in _todos() if p.aplica(c)}
+
+
+def parametros(c) -> list[str]:
+    return sorted(_params_de(c))
 
 
 # ----------------------------------------------------------------------------------------------- árvore
@@ -251,7 +292,7 @@ def _resolver(comps, caminho: str, obrigatorio: bool = True):
 
 
 def _valor_externo(p: _Param, v):
-    if v is None or p.tipo in ("enum", "bool"):
+    if v is None or p.tipo in ("enum", "bool", "material"):
         return v
     if p.tipo == "int":
         return int(v)
@@ -268,11 +309,23 @@ def descrever_componente(caminho: str, c, sim) -> dict:
     out = {"caminho": caminho, "tipo": str(c.getClass().getSimpleName()), "params": params}
     if c.isMassive():
         out["massa_material_kg"] = round(float(c.getComponentMass()), 4)
+    if isinstance(c, _rc("FinSet")):
+        out["geometria"] = geometria_aletas(c)
     return out
 
 
+def geometria_aletas(c) -> dict:
+    """Grandezas derivadas de UMA aleta (área, alongamento, afilamento, enflechamentos, CMA). Só as
+    trapezoidais têm o conjunto completo; nas outras, área e alongamento vêm do contorno do OpenRocket."""
+    if isinstance(c, _rc("TrapezoidFinSet")):
+        return aletas.geometria_trapezio(float(c.getRootChord()), float(c.getTipChord()), float(c.getHeight()),
+                                         float(c.getSweep()), float(c.getThickness()))
+    area, s = float(c.getPlanformArea()), float(c.getSpan())
+    return {"area_mm2": round(area * 1e6, 1), "alongamento": round(s * s / area, 4) if area > 0 else None}
+
+
 def opcoes_enum() -> dict[str, list[str]]:
-    return {p.nome: p.opcoes() for p in _todos() if p.tipo == "enum"}
+    return {p.nome: p.opcoes() for p in _todos() if p.opcoes is not None}
 
 
 # ----------------------------------------------------------------------------------------------- edição
@@ -288,6 +341,16 @@ def _converter(p: _Param, valor, onde: str):
         if alvo not in opcoes:
             raise ToolError(f"{onde}: valor {valor!r} inválido. Opções: {opcoes}")
         return alvo
+    if p.tipo == "material":
+        opcoes = {o.casefold(): o for o in p.opcoes()}
+        alvo = str(valor).strip().casefold()
+        if alvo not in opcoes:
+            parecidos = difflib.get_close_matches(str(valor), list(opcoes.values()), n=5, cutoff=0.4)
+            raise ToolError(f"{onde}: material {valor!r} não está no banco do OpenRocket. "
+                            + (f"Parecidos: {parecidos}. " if parecidos else "")
+                            + "Opções em ler_foguete (opcoes.material); para outra densidade, escolha o mais "
+                              "parecido e altere materialDensity_kg_m3.")
+        return opcoes[alvo]
     if p.tipo == "bool":
         if not isinstance(valor, bool):
             raise ToolError(f"{onde}: esperado true/false, recebido {valor!r}")
@@ -361,6 +424,25 @@ def _novo_lastro(comps, caminho: str, valores: dict, sim, aplicadas, efeitos):
         _aplicar(novo, mc, sim, param, v, aplicadas, efeitos)
 
 
+# Ordem de aplicação dentro de uma edição: trocar a referência recalcula o deslocamento (position_mm);
+# trocar o material recria a densidade; o ângulo de enflechamento depende do span (aplicado por último).
+_PRIMEIRO, _ULTIMO = ("positionReference", "material"), ("sweepAngle_deg",)
+
+
+def _ordem(param: str | None) -> int:
+    return 0 if param in _PRIMEIRO else 2 if param in _ULTIMO else 1
+
+
+def _sem_conflito(pares) -> None:
+    """sweepLength_mm e sweepAngle_deg do mesmo componente na mesma edição: um anula o outro."""
+    params: dict[str, tuple[str, set]] = {}
+    for caminho, param in pares:
+        params.setdefault(caminho.strip().casefold(), (caminho.strip(), set()))[1].add(param)
+    for caminho, ps in params.values():
+        if {"sweepLength_mm", "sweepAngle_deg"} <= ps:
+            raise ToolError(f"'{caminho}': informe sweepLength_mm OU sweepAngle_deg (um define o outro)")
+
+
 def editar(doc, sim, alteracoes: dict) -> dict:
     """Aplica {caminho.param: valor} e operações de componente:
     'Pai/Nome': {...} cria uma massa (MassComponent) se não existir, ou altera vários parâmetros;
@@ -368,8 +450,9 @@ def editar(doc, sim, alteracoes: dict) -> dict:
     if not isinstance(alteracoes, dict) or not alteracoes:
         raise ToolError("alteracoes: informe ao menos uma alteração {'Componente.param': valor}")
     aplicadas, efeitos = [], []
-    # positionReference antes de position_mm: trocar a referência recalcula o deslocamento
-    ordem = sorted(alteracoes.items(), key=lambda kv: not kv[0].endswith(".positionReference"))
+    _sem_conflito([_separar(k) for k in alteracoes]
+                  + [(k, p) for k, v in alteracoes.items() if isinstance(v, dict) for p in v])
+    ordem = sorted(alteracoes.items(), key=lambda kv: _ordem(_separar(kv[0])[1]))
     for chave, valor in ordem:
         comps = componentes(doc)
         caminho, param = _separar(chave)
@@ -391,7 +474,7 @@ def editar(doc, sim, alteracoes: dict) -> dict:
             if achado is None:
                 _novo_lastro(comps, caminho, valor, sim, aplicadas, efeitos)
             else:
-                for param, v in valor.items():
+                for param, v in sorted(valor.items(), key=lambda kv: _ordem(kv[0])):
                     _aplicar(achado[0], achado[1], sim, param, v, aplicadas, efeitos)
         else:
             raise ToolError(f"'{chave}': use 'Componente.param': valor, 'Pai/Nova massa': {{...}} ou "
@@ -428,3 +511,145 @@ def estabilidade_estatica(doc, sim, mach: float = 0.3) -> dict:
         "massa_burnout_kg": round(float(queima.getMass()), 3),
         "com_motor": bool(conf.hasMotors()),
     }
+
+
+# ----------------------------------------------------------------------------- aerodinâmica e aletas
+
+def conjuntos_aletas(doc) -> list[tuple[str, Any]]:
+    return [(p, c) for p, c in componentes(doc) if isinstance(c, _rc("FinSet"))]
+
+
+def resolver_aletas(doc, caminho: str | None) -> tuple[str, Any]:
+    """O conjunto de aletas pedido, ou o único do foguete."""
+    if caminho is not None:
+        achado_caminho, c = _resolver(componentes(doc), caminho)
+        if not isinstance(c, _rc("FinSet")):
+            raise ToolError(f"'{achado_caminho}' é {c.getClass().getSimpleName()}, não um conjunto de aletas")
+        return achado_caminho, c
+    todas = conjuntos_aletas(doc)
+    if len(todas) != 1:
+        raise ToolError("O foguete não tem aletas" if not todas else
+                        f"O foguete tem {len(todas)} conjuntos de aletas; informe aletas: {[p for p, _ in todas]}")
+    return todas[0]
+
+
+def resumo_aletas(caminho: str, c, sim) -> dict:
+    params = {k: v for k, v in descrever_componente(caminho, c, sim)["params"].items()
+              if k not in ("overrideMass_kg", "overrideMassIncludesChildren", "overrideCG_mm", "positionReference")}
+    dono = _massa_sobrescrita_por(c)
+    return {"caminho": caminho, "tipo": str(c.getClass().getSimpleName()), "params": params,
+            "geometria": geometria_aletas(c), "massa_material_kg": round(float(c.getComponentMass()), 4),
+            "massa_sobrescrita_por": _nome(dono) if dono is not None else None}
+
+
+def compensar_massa(c, massa_antes: float) -> str | None:
+    """Com a massa das aletas sobrescrita (por elas ou por um ancestral que inclui os filhos), soma ao
+    override a variação da massa calculada das aletas. Sem isso, mudar a geometria não muda a massa."""
+    dono = _massa_sobrescrita_por(c)
+    delta = float(c.getComponentMass()) - massa_antes
+    if dono is None or abs(delta) < 1e-9:
+        return None
+    antes = float(dono.getOverrideMass())
+    dono.setOverrideMass(antes + delta)
+    return (f"Massa sobrescrita de '{_nome(dono)}' ajustada de {antes:.4f} para {antes + delta:.4f} kg "
+            f"({delta:+.4f} kg, variação da massa calculada de '{_nome(c)}')")
+
+
+def _forcas(f, ref_cp: bool = True) -> dict:
+    cp = f.getCP()
+    cna = float(cp.weight) if cp is not None else 0.0
+    out = {"cna": round(cna, 4)}
+    if ref_cp:
+        out["cp_mm"] = round(float(cp.x) * 1000, 1) if cna != 0 and cp.x == cp.x else None
+    return out | {"cd": round(float(f.getCD()), 5), "cd_atrito": round(float(f.getFrictionCD()), 5),
+                  "cd_pressao": round(float(f.getPressureCD()), 5), "cd_base": round(float(f.getBaseCD()), 5)}
+
+
+def analise_aerodinamica(doc, sim, machs: list[float], aoa_rad: float = 0.0, altitude_m: float = 0.0,
+                         mach_componentes: float | None = None) -> dict:
+    """Modelo aerodinâmico do OpenRocket (Barrowman estendido) em cada Mach: CNα, CP, margem estática e CD
+    (atrito, pressão, base) do foguete e de cada conjunto de aletas; com mach_componentes, a contribuição
+    de todos os componentes nesse Mach. Atmosfera padrão (ISA) na altitude dada: o CD de atrito depende
+    do Reynolds. Com AoA = 0, 'cna' é a derivada linear; com AoA > 0 entra a sustentação do corpo
+    (não linear) e 'cna' vira CN/α efetivo."""
+    from info.openrocket.core.aerodynamics import BarrowmanCalculator, FlightConditions
+    from info.openrocket.core.logging import WarningSet
+    from info.openrocket.core.masscalc import MassCalculator
+    from info.openrocket.core.models.atmosphere import ExtendedISAModel
+
+    conf = doc.getRocket().getFlightConfiguration(sim.getFlightConfigurationId())
+    lanc, queima = MassCalculator.calculateLaunch(conf), MassCalculator.calculateBurnout(conf)
+    cg, cgq = float(lanc.getCM().x), float(queima.getCM().x)
+    caminhos = {str(c.getID()): p for p, c in componentes(doc)}
+    ids_aletas = {str(c.getID()) for _, c in conjuntos_aletas(doc)}
+    atmosfera = ExtendedISAModel().getConditions(float(altitude_m))
+    calc, avisos = BarrowmanCalculator(), WarningSet()
+
+    def condicoes(mach):
+        cond = FlightConditions(conf)
+        cond.setAtmosphericConditions(atmosfera)
+        cond.setMach(float(mach))
+        cond.setAOA(float(aoa_rad))
+        return cond
+
+    curvas = []
+    for mach in machs:
+        cond = condicoes(mach)
+        mapa = calc.getForceAnalysis(conf, cond, avisos)
+        ref = float(cond.getRefLength())
+        total = _forcas(calc.getAerodynamicForces(conf, cond, avisos))
+        cp = total["cp_mm"] / 1000 if total["cp_mm"] is not None else None
+        linha = {"mach": mach, "velocidade_ms": round(float(cond.getVelocity()), 1), **total,
+                 "margem_estatica_cal": round((cp - cg) / ref, 3) if cp is not None and ref > 0 else None,
+                 "margem_estatica_burnout_cal": round((cp - cgq) / ref, 3) if cp is not None and ref > 0 else None,
+                 "aletas": {}}
+        for e in mapa.entrySet():
+            if str(e.getKey().getID()) in ids_aletas:
+                f = _forcas(e.getValue())
+                f["fracao_cna"] = round(f["cna"] / total["cna"], 4) if total["cna"] else None
+                f["fracao_cd"] = round(f["cd"] / total["cd"], 4) if total["cd"] else None
+                linha["aletas"][caminhos[str(e.getKey().getID())]] = f
+        curvas.append(linha)
+    out = {"diametro_referencia_mm": round(float(condicoes(0.3).getRefLength()) * 1000, 1),
+           "area_referencia_mm2": round(float(condicoes(0.3).getRefArea()) * 1e6, 1),
+           "cg_mm": round(cg * 1000, 1), "cg_burnout_mm": round(cgq * 1000, 1),
+           "aoa_deg": round(math.degrees(aoa_rad), 3), "altitude_m": altitude_m, "curvas": curvas}
+    if mach_componentes is not None:
+        mapa = calc.getForceAnalysis(conf, condicoes(mach_componentes), avisos)
+        comps = []
+        for e in mapa.entrySet():
+            c = e.getKey()
+            if isinstance(c, _rc("ComponentAssembly")) or str(c.getID()) not in caminhos:
+                continue  # foguete, estágios e boosters: somas, já no total
+            f = _forcas(e.getValue())
+            if any(f[k] for k in ("cna", "cd")):
+                comps.append({"caminho": caminhos[str(c.getID())], "tipo": str(c.getClass().getSimpleName())} | f)
+        out["componentes"] = {"mach": mach_componentes, "lista": sorted(comps, key=lambda x: -abs(x["cna"]))}
+    out["avisos"] = sorted({str(w) for w in avisos})
+    return out
+
+
+# ------------------------------------------------------------------------------------- flutter (laminado)
+
+def geometria_flutter(caminho: str, c) -> dict:
+    """cr, ct, s e enflechamento do bordo de ataque (SI e graus) para fin_flutter.run_case."""
+    if not isinstance(c, _rc("TrapezoidFinSet")):
+        raise ToolError(f"'{caminho}' é {c.getClass().getSimpleName()}: o cálculo de flutter (placa trapezoidal) "
+                        "só aceita aletas trapezoidais")
+    return {"cr": float(c.getRootChord()), "ct": float(c.getTipChord()), "s": float(c.getHeight()),
+            "sweep_le_deg": math.degrees(float(c.getSweepAngle()))}
+
+
+def aplicar_laminado(caminho: str, c, nome: str, h: float, rho_eq: float) -> list[str]:
+    """docs/FLUTTER.md §13 passo 2: espessura = h do laminado e material 'Laminado <nome>' com densidade
+    rho_eq, para o OpenRocket recalcular massa, CG e arrasto. Devolve os avisos."""
+    c.setThickness(float(h))
+    c.setMaterial(_cls("material.Material").newMaterial(_cls("material.Material$Type").BULK, f"Laminado {nome}",
+                                                         float(rho_eq), True))
+    avisos = []
+    secao = str(c.getCrossSection().name())
+    if secao != "SQUARE":
+        # medido no Hemera: AIRFOIL tem ~85% do volume da placa
+        avisos.append(f"'{caminho}': seção {secao} no OpenRocket tem menos volume que a placa de espessura "
+                      "uniforme do modelo de flutter, então a massa calculada fica menor que m_A·área")
+    return avisos

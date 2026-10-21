@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -14,10 +15,13 @@ import anyio
 import anyio.from_thread
 import jpype
 import numpy as np
+import yaml
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import analise as an
+from . import fin_flutter as ff
+from . import flutter_estudo as fe
 from . import om_bridge as om
 from . import or_bridge as orb
 from . import or_foguete as of
@@ -36,6 +40,9 @@ mcp = MCPServer(
         "simular_voo (ou projetar_e_voar para tudo de uma vez). Para projetar um motor: "
         "listar_tipos_grao -> criar_motor -> editar_motor (simular=True) até atender aos requisitos. "
         "Para o foguete: ler_foguete -> editar_foguete (grava em arquivo novo) -> simular_voo; "
+        "analisar_aerodinamica mostra o modelo aerodinâmico (CNα, CP, CD por Mach e por componente) e "
+        "comparar_aletas compara geometrias de aletas lado a lado (aerodinâmica, voo e flutter); "
+        "analisar_flutter verifica aletas compósitas (laminado do fins_config.yaml, V-g, critérios); "
         "varrer_parametro compara vários valores de um parâmetro; otimizar_parametro busca o valor que atinge "
         "uma meta; analisar_dispersao estima o risco (Monte Carlo); exportar_series_* gera CSV. "
         "Com dados reais: comparar_curvas_empuxo, calibrar_motor (ensaio estático) e calibrar_voo (log do "
@@ -330,6 +337,7 @@ def ler_foguete(arquivo_ork: str, indice_simulacao: int = 0) -> dict:
     """Árvore completa do foguete: cada componente com o caminho (use-o em editar_foguete), o tipo e os
     parâmetros editáveis com valor atual (nomes em inglês com unidade: length_mm, span_mm, mass_kg,
     overrideMass_kg, deployAltitude_m...). overrideMass_kg/overrideCG_mm = null quando não sobrescritos.
+    Aletas trazem também a 'geometria' derivada (área, alongamento, afilamento, enflechamentos, CMA, t/c).
     Os parâmetros de abertura (deploy*) e a estabilidade se referem à simulação indice_simulacao."""
     doc, avisos = _carregar(arquivo_ork)
     sim = _simulacao(doc, indice_simulacao)
@@ -354,6 +362,8 @@ def editar_foguete(arquivo_ork: str, alteracoes: dict[str, Any], salvar_como: st
     alteracoes: {"Componente.param": valor}, com os caminhos e parâmetros de ler_foguete. Basta o final
     do caminho, se for único. Exemplos:
       "Fins.span_mm": 200 | "Fins.count": 3 | "Nosecone.shape": "OGIVE" | "Nosecone.length_mm": 550
+      "Fins.sweepAngle_deg": 40 | "Fins.material": "Fiberglass" | "Fins.materialDensity_kg_m3": 1600
+      "Fins.finish": "POLISHED" | "Fins.crossSection": "AIRFOIL" | "Fins.filletRadius_mm": 10
       "Payload 2U.mass_kg": 3.0 | "Recovery Module.overrideMass_kg": 5.5 (null remove o override)
       "Unreefed Parachute.deployAltitude_m": 400 | "Unreefed Parachute.deployEvent": "ALTITUDE"
       "Payload Module/Lastro": {"mass_kg": 0.5, "position_mm": 50}  cria uma massa (lastro) no pai
@@ -446,6 +456,361 @@ def varrer_parametro(arquivo_ork: str, parametro: str, valores: list[Any], indic
     return {"parametro": parametro, "tipo": "condicao_lancamento" if condicao else "foguete",
             "simulacao": nome_sim, "linhas": linhas,
             "efeitos": list(dict.fromkeys(e for e in efeitos if not e.startswith("O OpenRocket ajustou")))}
+
+
+MACHS_PADRAO = [0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.5, 2.0]
+
+
+def _machs(machs: list[float] | None, padrao: list[float]) -> list[float]:
+    machs = padrao if machs is None else machs
+    if not isinstance(machs, list) or not 1 <= len(machs) <= 30 or any(
+            isinstance(m, bool) or not isinstance(m, (int, float)) or not 0.01 <= m <= 5 for m in machs):
+        raise ToolError("machs: de 1 a 30 números entre 0,01 e 5")
+    return [float(m) for m in machs]
+
+
+@mcp.tool()
+@_erros_java
+def analisar_aerodinamica(arquivo_ork: str, indice_simulacao: int = 0, machs: list[float] | None = None,
+                          aoa_graus: float = 0.0, altitude_m: float = 0.0, mach_componentes: float | None = 0.3,
+                          alteracoes: dict[str, Any] | None = None, motor_eng: str | None = None,
+                          atraso_ejecao_s: float | None = None, montagem: str | None = None) -> dict:
+    """Modelo aerodinâmico do OpenRocket (Barrowman estendido), sem simular o voo: para cada Mach, CNα, CP,
+    margem estática (CG na decolagem e no burnout) e CD total dividido em atrito, pressão e base; e, para
+    cada conjunto de aletas, o CNα, o CP, o CD e a fração do total que elas respondem. Também devolve a
+    geometria derivada das aletas (área, alongamento s²/S, afilamento, enflechamentos, corda média
+    aerodinâmica, espessura relativa) e, em mach_componentes (null desliga), a contribuição de cada
+    componente. machs: até 30 valores (padrão: 0,1 a 2,0, com a região transônica detalhada).
+    aoa_graus: 0 dá a derivada linear CNα; > 0 inclui a sustentação não linear do corpo.
+    altitude_m: atmosfera padrão nessa altitude (muda o Reynolds e, com ele, o CD de atrito).
+    alteracoes: edições no formato de editar_foguete aplicadas só na memória (nada é gravado), para
+    um "e se" rápido. Para comparar várias geometrias de aletas lado a lado, use comparar_aletas."""
+    machs = _machs(machs, MACHS_PADRAO)
+    for nome, v, lo, hi in (("aoa_graus", aoa_graus, 0, 30), ("altitude_m", altitude_m, -500, 30000)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+            raise ToolError(f"{nome}: esperado um número entre {lo} e {hi}")
+    if mach_componentes is not None:
+        _machs([mach_componentes], [])
+    doc, avisos = _carregar(arquivo_ork)
+    sim = _simulacao(doc, indice_simulacao)
+    if motor_eng:  # o motor entra no CG
+        orb.trocar_motor(doc, sim, orb.registrar_motor(_caminho(motor_eng)), atraso_ejecao_s or 0.0, montagem)
+    with orb.LOCK:
+        r = of.editar(doc, sim, alteracoes) if alteracoes else None
+        out = of.analise_aerodinamica(doc, sim, machs, math.radians(aoa_graus), altitude_m, mach_componentes)
+        out["aletas"] = [of.resumo_aletas(p, c, sim) for p, c in of.conjuntos_aletas(doc)]
+    if r:
+        out |= {"alteracoes": r["aplicadas"], "efeitos": r["efeitos"]}
+    out["avisos_carregamento"] = avisos
+    return out
+
+
+def _variante(v, i: int, caminho_aletas: str, params_aletas: list[str],
+             cfg: dict | None = None) -> tuple[str, dict, str | None]:
+    """{'nome': ..., 'span_mm': 150, 'Nosecone.length_mm': 500, 'laminado': 'L6'} -> (nome, alterações de
+    editar_foguete, laminado). Chave sem caminho que é parâmetro das aletas vale para o conjunto escolhido."""
+    if not isinstance(v, dict) or not v:
+        raise ToolError(f"variantes[{i - 1}]: esperado um objeto {{'nome': ..., 'span_mm': ...}}")
+    v = dict(v)
+    nome = str(v.pop("nome", f"variante {i}"))
+    laminado = v.pop("laminado", None)
+    if laminado is not None:
+        if cfg is None:
+            raise ToolError(f"Variante '{nome}': 'laminado' exige arquivo_config")
+        if laminado not in cfg["laminates"]:
+            raise ToolError(f"Variante '{nome}': laminado '{laminado}' não está em {list(cfg['laminates'])}")
+        if "thickness_mm" in v:
+            raise ToolError(f"Variante '{nome}': com 'laminado' a espessura é a do laminado; tire thickness_mm")
+    alteracoes = {}
+    for k, val in v.items():
+        if k in params_aletas:
+            alteracoes[f"{caminho_aletas}.{k}"] = val
+        elif "." in k or isinstance(val, dict) or val is None:
+            alteracoes[k] = val
+        else:
+            raise ToolError(f"Variante '{nome}': '{k}' não é parâmetro de '{caminho_aletas}'. Aceitos: "
+                            f"{params_aletas}; para outros componentes use 'Componente.param'.")
+    if not alteracoes and laminado is None:
+        raise ToolError(f"Variante '{nome}': nenhuma alteração")
+    return nome, alteracoes, laminado
+
+
+def _achatar(d: dict, prefixo: str = "") -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out |= _achatar(v, f"{prefixo}{k}.")
+        elif isinstance(v, list):
+            out[prefixo + k] = " | ".join(map(str, v))
+        else:
+            out[prefixo + k] = v
+    return out
+
+
+@mcp.tool()
+async def comparar_aletas(arquivo_ork: str, variantes: list[dict[str, Any]], ctx: Context,
+                          aletas: str | None = None, indice_simulacao: int = 0, simular: bool = True,
+                          machs: list[float] | None = None, compensar_massa: bool = True,
+                          motor_eng: str | None = None, atraso_ejecao_s: float | None = None,
+                          montagem: str | None = None, opcoes_voo: dict[str, Any] | None = None,
+                          material_aletas: str | None = None, modulo_cisalhamento_aletas_gpa: float | None = None,
+                          arquivo_config: str | None = None, laminado: str | None = None,
+                          arquivo_csv: str | None = None, sobrescrever: bool = False) -> dict:
+    """Estudo de aletas: compara o original com até 30 variantes de geometria, lado a lado.
+    variantes: [{"nome": "maior", "span_mm": 200, "rootChord_mm": 300}, {"count": 3, "thickness_mm": 4}...].
+      Chaves sem caminho são parâmetros do conjunto 'aletas' (o único do foguete, se omitido): count,
+      rootChord_mm, tipChord_mm, span_mm (o "height" do OpenRocket), sweepLength_mm OU sweepAngle_deg,
+      thickness_mm, crossSection (SQUARE/ROUNDED/AIRFOIL), cantAngle_deg, position_mm, material,
+      materialDensity_kg_m3, finish, filletRadius_mm, tabHeight_mm, tabLength_mm. Outros componentes:
+      'Componente.param', como em editar_foguete. Mudar span_mm mantém o sweepLength_mm (o ângulo muda).
+    Para cada linha: parâmetros e geometria derivada das aletas (área, alongamento, afilamento,
+    enflechamentos, CMA, t/c), massa, margem estática, e em cada Mach de machs (padrão [0,3, 0,8]) o CNα,
+    o CP, a margem, o CD e a parte das aletas. Com simular=True, também o voo: apogeu, velocidade e Mach
+    máximos, estabilidade na saída do trilho e mínima, q máximo e, com material_aletas ('aluminio',
+    'aco', 'titanio') ou modulo_cisalhamento_aletas_gpa, a margem de flutter (NACA TN-4197).
+    compensar_massa: se a massa das aletas estiver sobrescrita (comum: o módulo inteiro pesado), soma ao
+    override a variação da massa calculada das aletas; sem isso, a geometria não mudaria a massa.
+    Aletas COMPÓSITAS (docs/FLUTTER.md §13): com arquivo_config (YAML de analisar_flutter), cada linha ganha
+    'flutter_laminado' (V-g na trajetória do estágio, divergência, TN-4197 e critérios da §12). O laminado
+    da linha é o da chave 'laminado' da variante, senão o parâmetro laminado, senão o do YAML para essas
+    aletas (ou o único do YAML); ele define a espessura e a densidade das aletas (não use thickness_mm).
+    Aqui as frequências são sempre as calculadas: as medidas só valem para a geometria ensaiada.
+    arquivo_csv grava a tabela achatada. Nada é gravado no .ork. O progresso é notificado."""
+    if not isinstance(variantes, list) or not 1 <= len(variantes) <= 30:
+        raise ToolError("variantes: de 1 a 30 objetos")
+    machs = _machs(machs, [0.3, 0.8])
+    opcoes = _opcoes_voo(opcoes_voo)
+    g_aletas = _g_aletas(material_aletas, modulo_cisalhamento_aletas_gpa)
+    destino_csv = _destino_novo(arquivo_csv, ".csv", sobrescrever) if arquivo_csv else None
+    cfg = _config_flutter(arquivo_config) if arquivo_config else None
+    if laminado is not None and (cfg is None or laminado not in cfg["laminates"]):
+        raise ToolError("laminado: exige arquivo_config e um nome de laminates"
+                        + (f" {list(cfg['laminates'])}" if cfg else ""))
+    if cfg is not None and not simular:
+        raise ToolError("O flutter do laminado usa a trajetória simulada: use simular=True")
+
+    def trabalho(progresso):
+        t0 = time.time()
+        doc, avisos = _carregar(arquivo_ork)
+        with orb.LOCK:
+            caminho, c = of.resolver_aletas(doc, aletas)
+            nome_java = str(c.getName()).strip()
+            padrao = laminado
+            if padrao is None and cfg is not None:
+                do_yaml = [v["laminado"] for k, v in cfg["aletas"].items() if of.resolver_aletas(doc, k)[0] == caminho]
+                padrao = do_yaml[0] if do_yaml else next(iter(cfg["laminates"])) if len(cfg["laminates"]) == 1 else None
+            planos = [("original", {}, padrao)] + [
+                (n, alt, lam or padrao) for n, alt, lam in
+                (_variante(v, i + 1, caminho, of.parametros(c), cfg) for i, v in enumerate(variantes))]
+        preparados = []
+        for nome, alt, lam in planos:  # tudo validado antes da primeira simulação
+            doc, _ = _carregar(arquivo_ork)
+            sim = _simulacao(doc, indice_simulacao)
+            if motor_eng:
+                orb.trocar_motor(doc, sim, orb.registrar_motor(_caminho(motor_eng)), atraso_ejecao_s or 0.0, montagem)
+            with orb.LOCK:
+                c = of.resolver_aletas(doc, caminho)[1]
+                massa_antes = float(c.getComponentMass())
+                efeitos_lam = []
+                if lam is not None:
+                    props = fe.propriedades_laminado(cfg, lam)
+                    efeitos_lam = of.aplicar_laminado(caminho, c, lam, props["h"], props["rho_eq"])
+                try:
+                    r = of.editar(doc, sim, alt) if alt else {"aplicadas": [], "efeitos": []}
+                except ToolError as e:
+                    raise ToolError(f"Variante '{nome}': {e}") from e
+                efeitos = r["efeitos"] + efeitos_lam
+                nota = of.compensar_massa(c, massa_antes) if compensar_massa else None
+                if nota:
+                    efeitos = [e for e in efeitos if "está sobrescrita" not in e] + [nota]
+                aero = of.analise_aerodinamica(doc, sim, machs)
+                linha = {"nome": nome, "alteracoes": r["aplicadas"], "efeitos": efeitos,
+                         "aletas": of.resumo_aletas(caminho, c, sim), "estabilidade": of.estabilidade_estatica(doc, sim),
+                         "aerodinamica": {f"M{a['mach']:g}": {
+                             "cna": a["cna"], "cp_mm": a["cp_mm"], "margem_estatica_cal": a["margem_estatica_cal"],
+                             "cd": a["cd"], "cna_aletas": a["aletas"][caminho]["cna"],
+                             "fracao_cna_aletas": a["aletas"][caminho]["fracao_cna"],
+                             "cd_aletas": a["aletas"][caminho]["cd"]} for a in aero["curvas"]}}
+            preparados.append((doc, sim, linha, c, lam))
+        for i, (doc, sim, linha, c, lam) in enumerate(preparados):
+            if simular:
+                res = _voar(doc, sim, None, atraso_ejecao_s, None, opcoes, [], g_aletas)
+                seg, ev = res["seguranca"], res["estabilidade_voo"]
+                flutter = seg["flutter"]
+                linha["voo"] = {
+                    "apogeu_m": res["apogeu_m"], "velocidade_max_ms": res["velocidade_max_ms"],
+                    "mach_max": res["mach_max"], "velocidade_saida_trilho_ms": res["velocidade_saida_trilho_ms"],
+                    "estabilidade_saida_trilho_cal": ev["saida_trilho_cal"],
+                    "estabilidade_min_subida_cal": ev["min_subida_cal"], "q_max_kpa": seg["q_max_kpa"],
+                    "flutter": next((f for f in flutter if f["aletas"] == nome_java), None)
+                    if isinstance(flutter, list) else flutter,
+                    "alertas_projeto": res["alertas_projeto"]}
+                if cfg is not None:
+                    linha["flutter_laminado"] = None if lam is None else _flutter_compacto(
+                        _flutter_aletas(cfg, caminho, c, lam, None, sim, ev)[0])
+            if progresso:
+                progresso(i + 1, len(preparados))
+        return [p[2] for p in preparados], caminho, avisos, time.time() - t0
+
+    linhas, caminho, avisos, duracao = await anyio.to_thread.run_sync(_erros_java(
+        lambda: trabalho(lambda i, n: anyio.from_thread.run(ctx.report_progress, i, n))))
+    out = {"aletas": caminho, "simulacao": indice_simulacao, "machs": machs, "linhas": linhas,
+           "avisos_carregamento": avisos, "tempo_s": round(duracao, 1)}
+    if destino_csv:
+        tabela = [_achatar({k: v for k, v in linha.items() if k not in ("alteracoes", "efeitos")}) for linha in linhas]
+        colunas = list(dict.fromkeys(k for t in tabela for k in t))
+        with destino_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(colunas)
+            for t in tabela:
+                w.writerow(["" if t.get(k) is None else t.get(k) for k in colunas])
+        out["arquivo_csv"] = _rel(destino_csv)
+    return out
+
+
+def _flutter_compacto(f: dict) -> dict:
+    """Linha de comparar_aletas: o essencial de _flutter_aletas."""
+    r, lam = f["resultado"], f["laminado"]
+    return {"laminado": lam["laminado"], "aprovado": f["criterios"]["aprovado"],
+            "aprovado_flutter": f["criterios"]["aprovado_flutter"],
+            **{k: r.get(k) for k in ("margem_flutter", "margem_flutter_casada", "regime_critico", "t_critico",
+                                     "M_critico", "margem_q_divergencia", "margem_TN4197", "f_h", "f_a")},
+            "h_mm": lam["h_mm"], "massa_area_kg_m2": lam["massa_area_kg_m2"], "rho_eq_kg_m3": lam["rho_eq_kg_m3"],
+            "reprovado_em": [v["verificacao"] for v in f["criterios"]["verificacoes"] if not v["ok"]],
+            "alertas": f["criterios"]["alertas"]}
+
+
+def _config_flutter(arquivo_config: str) -> dict:
+    p = _caminho(arquivo_config)
+    if p.suffix.lower() not in (".yaml", ".yml"):
+        raise ToolError(f"arquivo_config precisa ser .yaml/.yml (modelo em docs/FLUTTER.md §3.2): {arquivo_config}")
+    if not p.exists():
+        raise ToolError(f"Arquivo não encontrado: {arquivo_config}")
+    try:
+        dados = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except yaml.YAMLError as e:
+        raise ToolError(f"{arquivo_config}: YAML inválido: {e}") from e
+    return fe.carregar_config(dados)
+
+
+def _plano_laminados(doc, cfg: dict, laminados: dict | None) -> list[tuple[str, Any, str, Any]]:
+    """(caminho, conjunto de aletas, laminado, frequências medidas) de cada conjunto analisado.
+    laminados (ou cfg 'aletas'): {'Caminho/Das/Aletas': 'L6'} ou {...: {laminado, f_h_hz, f_a_hz}}. Sem mapa e
+    com um único laminado na configuração, ele vale para todas as aletas."""
+    mapa = fe.mapa_aletas(laminados, cfg["laminates"], "laminados") if laminados is not None else cfg["aletas"]
+    if not mapa:
+        todas = of.conjuntos_aletas(doc)
+        if len(cfg["laminates"]) != 1:
+            raise ToolError(f"Informe o laminado de cada conjunto de aletas em laminados (ou 'aletas' no YAML): "
+                            f"conjuntos {[p for p, _ in todas]}, laminados {list(cfg['laminates'])}")
+        unico = next(iter(cfg["laminates"]))
+        mapa = {p: {"laminado": unico, "freqs_hz": None} for p, _ in todas}
+    plano = []
+    for chave, v in mapa.items():
+        caminho, c = of.resolver_aletas(doc, chave)
+        plano.append((caminho, c, v["laminado"], v["freqs_hz"]))
+    if not plano:
+        raise ToolError("O foguete não tem aletas")
+    return plano
+
+
+def _flutter_aletas(cfg, caminho, c, laminado, freqs, sim, estabilidade_voo, sens: bool = False) -> tuple[dict, list]:
+    """run_case + critérios da §12 para um conjunto de aletas, na trajetória do estágio dele (voo já simulado).
+    Devolve o resumo e os pontos (margem ao longo do tempo)."""
+    with orb.LOCK:
+        geo = of.geometria_flutter(caminho, c)
+        estagio = c.getStage()
+    traj, origem = orb.trajetoria_estagio(sim, estagio)
+    an_ = cfg["analysis"]
+    plies, mats = cfg["laminates"][laminado], cfg["materials"]
+    kw = {"e_ea": an_["e_ea"], "eta_ref": an_["eta_ref"], "gs": an_["g_s"]}
+    try:
+        r = ff.run_case(geo, plies, mats, traj, freqs_hz=freqs, **kw)
+    except ValueError as e:
+        raise ToolError(f"Flutter de '{caminho}': {e}") from e
+    props = fe.propriedades_laminado(cfg, laminado)
+    avaliacao = fe.avaliar(r, cfg["criterios"], estabilidade_voo)
+    if props["placeholders"]:
+        avaliacao["alertas"].insert(0, f"PLACEHOLDER: propriedades sem ensaio em {props['placeholders']}; "
+                                       "resultado só indicativo")
+    out = {"aletas": caminho, "trajetoria": origem, "laminado": {k: v for k, v in props.items() if k not in ("h", "rho_eq")},
+           "geometria": {"cr_mm": round(geo["cr"] * 1e3, 2), "ct_mm": round(geo["ct"] * 1e3, 2),
+                         "s_mm": round(geo["s"] * 1e3, 2), "sweep_le_deg": round(geo["sweep_le_deg"], 2)},
+           "analise": an_, "resultado": fe.resumo(r), "criterios": avaliacao}
+    if sens:
+        out["sensibilidade"] = fe.sensibilidade(geo, plies, mats, traj, an_, cfg["criterios"], freqs)
+    return out, r["pontos"]
+
+
+@mcp.tool()
+@_erros_java
+def analisar_flutter(arquivo_ork: str, arquivo_config: str, laminados: dict[str, Any] | None = None,
+                     indice_simulacao: int = 0, motor_eng: str | None = None, atraso_ejecao_s: float | None = None,
+                     montagem: str | None = None, opcoes_voo: dict[str, Any] | None = None,
+                     aplicar_laminado: bool = True, compensar_massa: bool = True, sensibilidade: bool = False,
+                     arquivo_csv: str | None = None, salvar_como: str | None = None,
+                     sobrescrever: bool = False) -> dict:
+    """Flutter e divergência de aletas COMPÓSITAS (docs/FLUTTER.md): laminado pela CLPT, modos de placa
+    (Rayleigh-Ritz), seção típica 2 GDL com Theodorsen (subsônico) ou piston theory (supersônico), método
+    V-g, ao longo da trajetória simulada pelo OpenRocket; mais a checagem NACA TN-4197 e os critérios da §12.
+    arquivo_config: YAML do workspace com materials (propriedades da LÂMINA, SI), laminates (lâminas de baixo
+    para cima, theta a partir da ENVERGADURA), analysis (e_ea, eta_ref, g_s), opcionalmente aletas
+    (conjunto -> laminado e f_h_hz/f_a_hz medidas por tap test) e criterios. Modelo: workspace_teste/fins_config.yaml.
+    laminados: {'Caminho/Das/Aletas': 'L6_quasi'} ou {...: {'laminado': ..., 'f_h_hz': ..., 'f_a_hz': ...}};
+      tem prioridade sobre 'aletas' do YAML. Com um único laminado no YAML, ele vale para todas as aletas.
+    aplicar_laminado: escreve no foguete a espessura h e a densidade equivalente do laminado ANTES de simular
+      (massa, CG e arrasto coerentes); compensar_massa ajusta a massa sobrescrita, se houver.
+    Cada conjunto usa a trajetória do próprio estágio (sustentador: voo inteiro; booster: ramo dele).
+    sensibilidade=True roda e_ea 0,35/0,50, eta_ref 0,70/0,80 e G12 -30% (§13). arquivo_csv grava a margem ao
+    longo do tempo; salvar_como grava o .ork com o laminado aplicado. Margem null = sem flutter na faixa."""
+    cfg = _config_flutter(arquivo_config)
+    opcoes = _opcoes_voo(opcoes_voo)
+    destino_ork = _destino_novo(salvar_como, ".ork", sobrescrever) if salvar_como else None
+    destino_csv = _destino_novo(arquivo_csv, ".csv", sobrescrever) if arquivo_csv else None
+    doc, avisos = _carregar(arquivo_ork)
+    sim = _simulacao(doc, indice_simulacao)
+    if motor_eng:
+        orb.trocar_motor(doc, sim, orb.registrar_motor(_caminho(motor_eng)), atraso_ejecao_s or 0.0, montagem)
+    efeitos = []
+    with orb.LOCK:
+        plano = _plano_laminados(doc, cfg, laminados)
+        for caminho, c, laminado, _ in plano:
+            props = fe.propriedades_laminado(cfg, laminado)
+            if aplicar_laminado:
+                massa_antes = float(c.getComponentMass())
+                efeitos += of.aplicar_laminado(caminho, c, laminado, props["h"], props["rho_eq"])
+                efeitos.append(f"'{caminho}': espessura {props['h_mm']} mm e densidade {props['rho_eq_kg_m3']} kg/m³ "
+                               f"(laminado {laminado}); massa calculada {massa_antes:.4f} -> "
+                               f"{float(c.getComponentMass()):.4f} kg")
+                nota = of.compensar_massa(c, massa_antes) if compensar_massa else None
+                if nota:
+                    efeitos.append(nota)
+            elif abs(float(c.getThickness()) - props["h"]) > 1e-5:
+                efeitos.append(f"'{caminho}': espessura no .ork ({float(c.getThickness()) * 1e3:.2f} mm) diferente "
+                               f"do laminado ({props['h_mm']} mm): massa e arrasto do voo não batem com o flutter")
+    res = _voar(doc, sim, None, atraso_ejecao_s, None, opcoes, avisos)
+    aletas, linhas_csv = [], []
+    for caminho, c, laminado, freqs in plano:
+        resumo_aletas, pontos = _flutter_aletas(cfg, caminho, c, laminado, freqs, sim, res["estabilidade_voo"],
+                                                sensibilidade)
+        aletas.append(resumo_aletas)
+        linhas_csv += [[caminho, p["t"], p["V"], p["M"], p["V_F"], p["margem"], p["regime"]] for p in pontos]
+    out = {"aletas": aletas, "aprovado": all(a["criterios"]["aprovado"] for a in aletas),
+           "aprovado_flutter": all(a["criterios"]["aprovado_flutter"] for a in aletas),
+           "voo": {k: res[k] for k in ("apogeu_m", "velocidade_max_ms", "mach_max", "estabilidade", "estabilidade_voo",
+                                       "alertas_projeto")},
+           "efeitos": efeitos, "placeholders": cfg["placeholders"], "avisos_carregamento": avisos}
+    if destino_ork:
+        orb.salvar_ork(doc, destino_ork)
+        out["arquivo_ork"] = _rel(destino_ork)
+    if destino_csv:
+        with destino_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["aletas", "t_s", "V_ms", "mach", "V_F_ms", "margem", "regime"])
+            for linha in linhas_csv:
+                w.writerow(["" if isinstance(x, float) and not math.isfinite(x) else x for x in linha])
+        out["arquivo_csv"] = _rel(destino_csv)
+    return out
 
 
 def _avaliador_voo(arquivo_ork, parametro, indice_simulacao, motor_eng, atraso_ejecao_s, montagem, opcoes,

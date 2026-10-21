@@ -1,4 +1,5 @@
-"""Fixtures: workspace temporário (motor.ric e foguete.ork tirados de vendor/) e o servidor em memória.
+"""Fixtures: workspace temporário (motor.ric, foguete.ork e dois_estagios.ork tirados de vendor/, e o
+fins_config.yaml de exemplo) e o servidor em memória.
 
 O server.py lê ROCKET_MCP_WORKSPACE na importação, então a variável é definida aqui, antes de qualquer
 import do servidor. A JVM é única por processo: sobe uma vez para a sessão inteira, em segundo plano,
@@ -17,6 +18,8 @@ VENDOR = RAIZ / "vendor"
 MOTOR_TINY = VENDOR / "openMotor" / "test" / "data" / "regression" / "tiny" / "motor.ric"
 JAR = VENDOR / "OpenRocket-24.12.jar"
 ORK_EXEMPLO = "datafiles/examples/A simple model rocket.ork"
+ORK_DOIS_ESTAGIOS = "datafiles/examples/Two stage high power rocket.ork"
+FINS_CONFIG = RAIZ / "workspace_teste" / "fins_config.yaml"
 
 WORKSPACE = Path(tempfile.mkdtemp(prefix="rocket_mcp_ws_")).resolve()
 os.environ["ROCKET_MCP_WORKSPACE"] = str(WORKSPACE)
@@ -28,6 +31,8 @@ def pytest_sessionstart(session):
     shutil.copy(MOTOR_TINY, WORKSPACE / "motor.ric")
     with zipfile.ZipFile(JAR) as z:
         (WORKSPACE / "foguete.ork").write_bytes(z.read(ORK_EXEMPLO))
+        (WORKSPACE / "dois_estagios.ork").write_bytes(z.read(ORK_DOIS_ESTAGIOS))
+    shutil.copy(FINS_CONFIG, WORKSPACE / "fins_config.yaml")
 
 
 def pytest_sessionfinish(session, exitstatus):
